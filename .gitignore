@@ -1,0 +1,11 @@
+.venv/
+__pycache__/
+*.pyc
+.smoke/*.pdf
+.smoke/*.png
+build/
+dist/
+*.spec
+
+# Unrelated project (its own git repo) that ended up nested in this folder
+suggestions-personnel/

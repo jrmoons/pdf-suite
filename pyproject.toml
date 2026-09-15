@@ -1,0 +1,20 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "pdf-suite"
+version = "0.1.0"
+description = "Application PDF de bureau (Windows) : visionneuse, annotations, edition de pages, edition de texte, formulaires et signature. Basee sur PySide6 + PyMuPDF + pikepdf."
+requires-python = ">=3.10"
+dependencies = [
+    "PySide6>=6.7",
+    "PyMuPDF>=1.24",
+    "pikepdf>=8.0",
+]
+
+[project.scripts]
+pdfsuite = "pdfsuite.main:main"
+
+[tool.setuptools]
+packages = ["pdfsuite"]
