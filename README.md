@@ -14,6 +14,13 @@ pdfsuite.bat "C:\chemin\vers\document.pdf"
 (la première ligne suffit depuis n'importe quel dossier, le `.bat` pointe
 vers l'environnement virtuel `.venv` du projet)
 
+### Exe autonome + raccourci sur le Bureau
+
+Double-cliquer sur `creer_raccourci.bat` : construit `dist\PDFSuite.exe`
+(PyInstaller) puis crée le raccourci « PDF Suite » sur le Bureau.
+L'exe est aussi construit automatiquement par GitHub Actions à chaque push
+(onglet Actions → artefact `PDFSuite-windows`).
+
 ## Fonctionnalités actuelles (V1)
 
 - **Visionneuse** : ouverture multi-documents par onglets, défilement continu,
@@ -57,7 +64,6 @@ vers l'environnement virtuel `.venv` du projet)
 - Pas encore de : OCR, conversion PDF ↔ Word/Excel/Image, impression,
   recherche de texte plein document, sélection/copie de texte libre,
   compression avancée, comparaison de documents.
-- Pas encore packagé en .exe autonome (nécessite Python + venv pour l'instant).
 
 Dis-moi quelles fonctionnalités ajouter en priorité et je les intègre.
 
