@@ -70,25 +70,3 @@ python -m venv .venv
 ```
 
 Tests de fumée (rendu hors écran, sans interface visible) dans `.smoke/`.
-
-## Générateur d'oiseaux animés (`oiseaux/`)
-
-Petit logiciel séparé, qui partage le même `.venv` (Pillow en plus, voir
-`requirements.txt`) :
-
-```
-.venv\Scripts\pip install -r requirements.txt
-oiseaux.bat
-```
-
-- Choix de la **largeur** et de la **hauteur** de l'image (en pixels), du
-  **nombre d'oiseaux** et d'une à trois **couleurs** (rouge, vert, bleu).
-- Les oiseaux sont placés **au hasard** et **volent** (aperçu animé dans la
-  fenêtre, bouton Pause/Lecture, vitesse réglable).
-- **Aucun oiseau n'en touche un autre** : chaque déplacement est vérifié
-  avant d'être appliqué (rebond sinon). Deux oiseaux de **même couleur**
-  gardent une distance encore plus grande.
-- La **taille des oiseaux s'adapte** au nombre d'oiseaux, au nombre de
-  couleurs et aux dimensions ; si c'est impossible, un message l'indique.
-- **Exporter en GIF…** : GIF animé en boucle, durée et nombre d'images par
-  seconde réglables.
