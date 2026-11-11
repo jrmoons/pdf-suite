@@ -33,10 +33,18 @@
   alter an object other than in an operation »). `new_page`/`insert_pdf` refusés par le journal
   → `_swap_op` (copie du document). Copier des pages DEPUIS le document journalisé est refusé
   → `_plain_copy()`.
-- Pièce auto = `room_detect.py` (numpy) : murs = éléments des CALQUES dont le nom contient
-  mur/poteau/…, portes/fenêtres = calque « porte/fenêtre » (traits droits = seuils), arcs de
-  porte ignorés. Plan sans calques → refus expliqué (la détection par image a été essayée et
-  abandonnée : cotes et cloisons tracées pareil). Validé sur le plan réel Arlon RDC (1:50).
+- Pièce auto = `room_detect.py` (refaite le 2026-11-11) : `prepare()` lit UNE fois la page
+  (cache `doc._room_cache`, lancé au choix de l'outil) : masque des murs peint dans l'ORDRE du
+  dessin (les hachures sont de longues lignes masquées ensuite par des remplissages blancs),
+  traits noirs/gris des calques mur (pas « porteur » = porte !), remplissages clairs/colorés
+  ignorés (meubles). « Ponts » = portes/fenêtres fermées au nu du mur entre deux traits
+  colinéaires, avec tableaux aux deux bouts + indice (vitrage du calque fenêtre ou arc de porte) ;
+  pointillés (linteaux) comblés ; passages ouverts ≤ 2 m utilisés seulement si la zone contient
+  2 étiquettes « xx m² » du plan. Contour recalé sur les vrais traits (`_snap_edges`), cadres de
+  porte retirés (`_remove_frames`). Banc d'essai : `.smoke/bench_pieces_arlon.py` (copies des
+  plans Arlon dans %TEMP%\claude_arlon) : 121/171 pièces à 2 % près, ~0,03 s par clic.
+  Échecs restants connus : murs hors calque « Mur » (ex. cloison sur calque vide).
+- Surfaces toujours au moins 2 décimales (`fmt_area_pts2`), même si l'unité est en cm sans décimale.
 - Cote = `DimensionItem` (annotation_items), stockée en PolyLine A, A', B', B,
   subject `pdfsuite:measure_dimension`.
 - Texte modifié : `replace_text_in_rect` réécrit à l'origine/couleur/direction du span

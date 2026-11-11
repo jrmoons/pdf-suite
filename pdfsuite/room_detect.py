@@ -284,6 +284,16 @@ def point_in_poly(x, y, poly) -> bool:
 # -- main entry -------------------------------------------------------------
 WALL_WORDS = ("mur", "wall", "cloison", "poteau", "column", "voile", "porteur", "maçonnerie")
 OPENING_WORDS = ("fenêtre", "fenetre", "porte", "door", "window", "menuiserie", "baie")
+_OPEN_RE = __import__("re").compile(r"fen[eê]tre|portes?|door|window|menuiserie|baie")
+
+
+def _is_opening_layer(n: str) -> bool:
+    """'Macro de fenêtre, porte' yes, 'Mur maçonnerie porteur' no."""
+    return bool(_OPEN_RE.search(n))
+
+
+def _is_wall_layer(n: str) -> bool:
+    return any(w in n for w in WALL_WORDS) and not _is_opening_layer(n)
 
 
 def _norm(name: str) -> str:
@@ -299,9 +309,9 @@ def layer_roles(doc) -> dict:
         return roles
     for xref, info in ocgs.items():
         n = _norm(info.get("name"))
-        if any(w in n for w in OPENING_WORDS):
+        if _is_opening_layer(n):
             roles[xref] = "opening"
-        elif any(w in n for w in WALL_WORDS):
+        elif _is_wall_layer(n):
             roles[xref] = "wall"
     return roles
 
@@ -352,139 +362,551 @@ def _gray(rgb):
     return QColor(v, v, v)
 
 
-def _walls_mask(doc, page_no, clip, zoom):
-    """Walls only: the drawing items of the wall layers (Mur, Poteau...)
-    near the click are painted into a mask. Dimension lines, texts and
-    furniture are on no layer / other layers, so they are left out."""
-    from PySide6.QtCore import QPointF, QRectF, Qt
+
+# -- page preparation (once per page and scale, then every click is fast) -----
+PREP_PX_M = 0.012           # metres per pixel of the page wall mask
+MAX_PREP_PX = 45e6          # mask size limit (pixels)
+BRIDGE_MIN_M, BRIDGE_MAX_M = 0.2, 4.6   # door / window widths closed by a bridge
+MAX_ROOM_M2 = 400.0
+PASSAGE_MAX_M = 2.0         # open passage (no door) closed between wall ends
+SNAP_TOL_PX = 3.5           # outline edge -> drawing line distance (mask pixels)
+
+
+def _neutral_dark(rgb, limit=0.6) -> bool:
+    """Black / dark grey (walls), not coloured (axes, furniture...)."""
+    if not rgb:
+        return True
+    if len(rgb) == 1:
+        return rgb[0] < limit
+    if len(rgb) == 4:                       # CMYK
+        c, m, y, k = rgb
+        rgb = ((1 - c) * (1 - k), (1 - m) * (1 - k), (1 - y) * (1 - k))
+    r, g, b = rgb[:3]
+    return max(r, g, b) - min(r, g, b) < 0.12 and 0.3 * r + 0.59 * g + 0.11 * b < limit
+
+
+class _Prep:
+    pass
+
+
+def _xf(m):
+    if m is None:
+        return lambda p: (float(p[0]), float(p[1]))
+    return lambda p: tuple(pymupdf.Point(p) * m)
+
+
+def is_prepared(doc, page_no: int) -> bool:
+    key = (page_no, round(doc.scale_points_per_meter or 0, 4))
+    return key in doc.__dict__.get("_room_cache", {})
+
+
+def prepare(doc, page_no: int):
+    """Wall lines, door / window bridges and a wall mask of the whole page,
+    cached on the document (≈1-2 s on a big plan, done once)."""
+    scale = doc.scale_points_per_meter
+    cache = doc.__dict__.setdefault("_room_cache", {})
+    key = (page_no, round(scale or 0, 4))
+    prep = cache.get(key)
+    if prep is not None:
+        return prep
+    from PySide6.QtCore import QLineF, QPointF, Qt
     from PySide6.QtGui import QImage, QPainter, QPainterPath, QPen, QBrush, QColor, QPolygonF
-    W = max(1, int(clip.width * zoom))
-    H = max(1, int(clip.height * zoom))
-    img = QImage(W, H, QImage.Format_Grayscale8)
-    img.fill(255)
+
     page = doc.page(page_no)
     m = ~page.derotation_matrix if page.rotation else None
+    T = _xf(m)
+    w_pts, h_pts = doc.visual_size(page_no)
+    zoom = 1.0 / (PREP_PX_M * scale)
+    zoom = min(zoom, math.sqrt(MAX_PREP_PX / max(1.0, w_pts * h_pts)))
+    W, H = int(w_pts * zoom) + 2, int(h_pts * zoom) + 2
+    img = QImage(W, H, QImage.Format_Grayscale8)
+    img.fill(255)
     qp = QPainter(img)
     qp.setRenderHint(QPainter.Antialiasing, False)
     qp.scale(zoom, zoom)
-    qp.translate(-clip.x0, -clip.y0)
-    black = QColor(0, 0, 0)
-
-    def P(pt):
-        if m is not None:
-            pt = pymupdf.Point(pt) * m
-        return QPointF(pt[0], pt[1])
-
-    view = QRectF(clip.x0, clip.y0, clip.width, clip.height)
+    P = lambda p: QPointF(*T(p))
+    segs, arcs, ev_lines, ev_arcs = [], [], [], []
+    min_len = 0.015 * scale
+    # painted in drawing order, as on screen: the hatching of the walls is
+    # long lines hidden afterwards by white fills, they must stay hidden
     for path in page.get_cdrawings():
         lname = _norm(path.get("layer"))
-        if not any(w in lname for w in WALL_WORDS):
+        is_wall = _is_wall_layer(lname)
+        is_open = _is_opening_layer(lname)
+        if not (is_wall or is_open):
             continue
-        r = pymupdf.Rect(path["rect"])
-        if m is not None:
-            r = r * m
-        if not QRectF(r.x0, r.y0, r.width, r.height).adjusted(-2, -2, 2, 2).intersects(view):
+        items = path.get("items", ())
+        for it in items:
+            if it[0] == "c" and "s" in path["type"]:      # door swing arcs
+                a, b = T(it[1]), T(it[4])
+                arcs.append(((a[0] + b[0]) / 2, (a[1] + b[1]) / 2, math.dist(a, b)))
+                ev_arcs.append((a, b))
+            elif is_open and it[0] == "l":
+                ev_lines.append(T(it[1]) + T(it[2]))
+            elif is_open and it[0] == "re":
+                r = pymupdf.Rect(it[1])
+                c = [T((r.x0, r.y0)), T((r.x1, r.y0)), T((r.x1, r.y1)), T((r.x0, r.y1))]
+                ev_lines += [c[i] + c[(i + 1) % 4] for i in range(4)]
+        if not is_wall:
             continue
         qpath = QPainterPath()
-        for it in path.get("items", ()):
+        for it in items:
             op = it[0]
             if op == "l":
                 a, b = P(it[1]), P(it[2])
                 if qpath.elementCount() == 0 or qpath.currentPosition() != a:
                     qpath.moveTo(a)
                 qpath.lineTo(b)
+                pairs = [(T(it[1]), T(it[2]))]
             elif op == "c":
-                if path["type"] == "s":
-                    continue          # door swing arcs: not walls
+                if "f" not in path["type"]:
+                    continue                 # stroked arcs: door swings, not walls
                 a = P(it[1])
                 if qpath.elementCount() == 0 or qpath.currentPosition() != a:
                     qpath.moveTo(a)
                 qpath.cubicTo(P(it[2]), P(it[3]), P(it[4]))
+                continue
             elif op == "re":
-                rr = pymupdf.Rect(it[1])
-                qpath.addPolygon(QPolygonF([P((rr.x0, rr.y0)), P((rr.x1, rr.y0)),
-                                            P((rr.x1, rr.y1)), P((rr.x0, rr.y1))]))
+                r = pymupdf.Rect(it[1])
+                c = [T((r.x0, r.y0)), T((r.x1, r.y0)), T((r.x1, r.y1)), T((r.x0, r.y1))]
+                qpath.addPolygon(QPolygonF([QPointF(*p) for p in c]))
                 qpath.closeSubpath()
+                pairs = [(c[i], c[(i + 1) % 4]) for i in range(4)]
             elif op == "qu":
                 q = it[1]
-                qpath.addPolygon(QPolygonF([P(q[0]), P(q[1]), P(q[3]), P(q[2])]))
+                c = [T(q[0]), T(q[1]), T(q[3]), T(q[2])]
+                qpath.addPolygon(QPolygonF([QPointF(*p) for p in c]))
                 qpath.closeSubpath()
+                pairs = [(c[i], c[(i + 1) % 4]) for i in range(4)]
+            else:
+                continue
+            for a, b in pairs:
+                if math.dist(a, b) >= min_len:
+                    segs.append((a[0], a[1], b[0], b[1]))
         if path.get("closePath"):
             qpath.closeSubpath()
-        if path.get("even_odd"):
-            qpath.setFillRule(Qt.OddEvenFill)
-        else:
-            qpath.setFillRule(Qt.WindingFill)
+        qpath.setFillRule(Qt.OddEvenFill if path.get("even_odd") else Qt.WindingFill)
         if "f" in path["type"]:
-            qp.fillPath(qpath, QBrush(_gray(path.get("fill"))))
+            g = 0 if _neutral_dark(path.get("fill")) else 255   # light fill: floor, furniture
+            qp.fillPath(qpath, QBrush(QColor(g, g, g)))
         if "s" in path["type"]:
-            pen = QPen(_gray(path.get("color")), max(path.get("width") or 0, 1.0 / zoom))
+            col = path.get("color")
+            if _neutral_dark(col):
+                pen = QPen(QColor(0, 0, 0), 2.0)
+            elif _gray(col).red() > 200:
+                pen = QPen(QColor(255, 255, 255), 1.0)  # white lines erase
+            else:
+                continue                             # coloured: axes, annotations
+            pen.setCosmetic(True)
             qp.strokePath(qpath, pen)
     qp.end()
-    ptr = img.constBits()
-    arr = np.frombuffer(ptr, np.uint8, count=img.bytesPerLine() * H).reshape(H, img.bytesPerLine())[:, :W]
-    return arr < 128
+    arr = np.frombuffer(img.constBits(), np.uint8,
+                        count=img.bytesPerLine() * H).reshape(H, img.bytesPerLine())[:, :W]
+    mask = arr < 128
+    segs = np.array(segs, float).reshape(-1, 4)
+    segs = _visible(segs, mask, zoom)
+    bridges, fillers, kinds = _bridges(segs, scale, (ev_lines, ev_arcs))
+    closers = np.vstack([bridges, fillers])
+
+    def lines_mask(lines):
+        img2 = QImage(W, H, QImage.Format_Grayscale8)
+        img2.fill(255)
+        if len(lines):
+            qp = QPainter(img2)
+            qp.setRenderHint(QPainter.Antialiasing, False)
+            qp.scale(zoom, zoom)
+            pen = QPen(QColor(0, 0, 0), 2.0)
+            pen.setCosmetic(True)
+            qp.setPen(pen)
+            qp.drawLines([QLineF(*b) for b in lines])
+            qp.end()
+        a2 = np.frombuffer(img2.constBits(), np.uint8,
+                           count=img2.bytesPerLine() * H).reshape(H, img2.bytesPerLine())[:, :W]
+        return a2 < 128
+
+    passage = np.array([k == "passage" for k in kinds], bool)
+    strong = np.vstack([bridges[~passage], fillers]) if len(bridges) else fillers
+    mask_strong = mask | lines_mask(strong)
+    mask_all = mask_strong | lines_mask(bridges[passage]) if passage.any() else mask_strong
+    prep = _Prep()
+    prep.zoom = zoom
+    prep.mask = mask_strong
+    prep.mask_all = mask_all
+    prep.labels = _room_labels(page, m, zoom)
+    prep.segs = segs
+    prep.bridges = bridges
+    prep.kinds = kinds
+    prep.lines = np.vstack([segs, closers])
+    prep.arcs = arcs
+    prep.scale = scale
+    prep.runs = {}
+    cache.clear()                      # one page at a time is enough
+    cache[key] = prep
+    return prep
 
 
-class _Leak(Exception):
-    pass
+def _visible(segs, mask, zoom):
+    """Only the lines really visible in the wall mask (not hidden hatching)."""
+    if not len(segs):
+        return segs
+    H, W = mask.shape
+    k = 9
+    t = (np.arange(k) + 0.5) / k
+    xs = (segs[:, 0:1] + (segs[:, 2:3] - segs[:, 0:1]) * t) * zoom
+    ys = (segs[:, 1:2] + (segs[:, 3:4] - segs[:, 1:2]) * t) * zoom
+    xi = np.clip(xs.astype(int), 0, W - 1)
+    yi = np.clip(ys.astype(int), 0, H - 1)
+    near = dilate(mask, 1)             # the line may be drawn one pixel aside
+    cover = near[yi, xi].mean(axis=1)
+    return segs[cover >= 0.85]
 
 
-def _find_region(doc, page_no, cx, cy, scale, window_m):
-    """Flood-fill the room around (cx, cy) inside a square of ``window_m``
-    metres. Raises _Leak if the room reaches the border of that square."""
-    w_pts, h_pts = doc.visual_size(page_no)
-    size = window_m * scale
-    zoom = min(ZOOM_HI, MAX_HI_PX / size)
-    half = size / 2
-    clip = pymupdf.Rect(max(0, cx - half), max(0, cy - half),
-                        min(w_pts, cx + half), min(h_pts, cy + half))
-    walls = _walls_mask(doc, page_no, clip, zoom)
-    walls = closing(walls, 2)                       # hatching -> solid wall
-    # doors / windows: their straight lines (threshold, glazing) close the
-    # openings at the wall face; arcs (door swings) are ignored
-    barrier = np.zeros_like(walls)
-    for it in _layer_items(doc, page_no, OPENING_WORDS):
-        if it[0] == "l":
-            (x0, y0), (x1, y1) = it[1], it[2]
-            _draw_line(barrier, (x0 - clip.x0) * zoom, (y0 - clip.y0) * zoom,
-                       (x1 - clip.x0) * zoom, (y1 - clip.y0) * zoom)
-    barrier = closing(barrier, 5) | walls           # join dashed threshold lines
-    # pool to the analysis grid (real size)
-    zoom_lo = max(0.2, min(6.0, 1.0 / (PX_M * scale)))
-    f = max(1, int(round(zoom / zoom_lo)))
-    if f > 1:
-        Hh, Wh = (barrier.shape[0] // f) * f, (barrier.shape[1] // f) * f
-        barrier = barrier[:Hh, :Wh].reshape(Hh // f, f, Wh // f, f).any(axis=(1, 3))
-        walls = walls[:Hh, :Wh].reshape(Hh // f, f, Wh // f, f).any(axis=(1, 3))
-        zoom = zoom / f
-    px_m = 1.0 / (zoom * scale)
-    H, W = barrier.shape
-    sx, sy = int((cx - clip.x0) * zoom), int((cy - clip.y0) * zoom)
-    if not (0 <= sx < W and 0 <= sy < H):
-        raise RoomError("Cliquez à l'intérieur d'une pièce.")
-    if barrier[sy, sx]:
-        # clicked on a wall / label: nearest free point within 50 cm
-        r0 = max(2, int(0.5 / px_m))
-        y0, y1, x0, x1 = max(0, sy - r0), min(H, sy + r0), max(0, sx - r0), min(W, sx + r0)
-        ys, xs = np.nonzero(~barrier[y0:y1, x0:x1])
-        if len(ys) == 0:
-            raise RoomError("Cliquez à l'intérieur d'une pièce (pas sur un mur).")
-        k = np.argmin((ys + y0 - sy) ** 2 + (xs + x0 - sx) ** 2)
-        sy, sx = int(ys[k] + y0), int(xs[k] + x0)
-    touches_page = (clip.x0 <= 0, clip.y0 <= 0, clip.x1 >= w_pts, clip.y1 >= h_pts)
-    for g in (0.0, 0.25, 0.45, 0.6):                # small gaps only (missing lines)
-        r = int(round(g / px_m))
-        closed = closing(barrier, r) if r else barrier
-        if closed[sy, sx]:
+def _bridges(segs: np.ndarray, scale: float, evidence=((), ())):
+    """Doors and windows interrupt the wall faces: the gap between two
+    pieces of the SAME straight line (collinear wall lines) is closed by a
+    'bridge', exactly on the wall face, when both ends are wall ends (a
+    jamb line leaves each end across the face)."""
+    if not len(segs):
+        return np.zeros((0, 4)), np.zeros((0, 4)), []
+    x0, y0, x1, y1 = segs.T
+    th = np.arctan2(y1 - y0, x1 - x0) % math.pi
+    th[th > math.pi - 0.002] -= math.pi
+    ux, uy = np.cos(th), np.sin(th)
+    rho = -uy * x0 + ux * y0
+    t0 = ux * x0 + uy * y0
+    t1 = ux * x1 + uy * y1
+    lo, hi = np.minimum(t0, t1), np.maximum(t0, t1)
+    ang_tol, rho_tol = 0.004, 0.006 * scale
+    gmin, gmax = BRIDGE_MIN_M * scale, BRIDGE_MAX_M * scale
+    cell = 0.02 * scale
+    ends = {}
+    for k in range(len(segs)):
+        for (px, py), (qx, qy) in (((x0[k], y0[k]), (x1[k], y1[k])),
+                                   ((x1[k], y1[k]), (x0[k], y0[k]))):
+            ends.setdefault((int(px // cell), int(py // cell)), []).append((px, py, qx - px, qy - py))
+    jt = 0.01 * scale
+    # door / window drawing at the gap: glazing / sill lines along it (window)
+    # or a swing arc hinged at one end with the gap's width (door). A gap
+    # without any is a corridor or a coincidence, not an opening.
+    ev_lines, ev_arcs = evidence
+    EL = np.array(ev_lines, float).reshape(-1, 4)
+    need_evidence = bool(len(EL) or ev_arcs)
+    near_end = 0.2 * scale
+    # arcs: a, b, radius (chord of a quarter circle / sqrt 2)
+    AR = np.array([(a[0], a[1], b[0], b[1], math.dist(a, b) / math.sqrt(2)) for a, b in ev_arcs],
+                  float).reshape(-1, 5)
+
+    def has_evidence(pa, pb):
+        L = math.dist(pa, pb)
+        dx, dy = (pb[0] - pa[0]) / L, (pb[1] - pa[1]) / L
+        if len(EL):
+            ex0, ey0, ex1, ey1 = EL.T
+            vx, vy = ex1 - ex0, ey1 - ey0
+            vl = np.hypot(vx, vy) + 1e-9
+            par = np.abs(vx * dy - vy * dx) / vl < 0.05
+            d0 = np.abs((ex0 - pa[0]) * dy - (ey0 - pa[1]) * dx)
+            d1 = np.abs((ex1 - pa[0]) * dy - (ey1 - pa[1]) * dx)
+            t0 = (ex0 - pa[0]) * dx + (ey0 - pa[1]) * dy
+            t1 = (ex1 - pa[0]) * dx + (ey1 - pa[1]) * dy
+            ov = np.minimum(np.maximum(t0, t1), L) - np.maximum(np.minimum(t0, t1), 0)
+            ok = par & (d0 < 0.4 * scale) & (d1 < 0.4 * scale) & (ov > 0.5 * L)
+            if ok.any():
+                return "fenêtre"
+        if len(AR):
+            ok = (AR[:, 4] >= 0.4 * L) & (AR[:, 4] <= 1.25 * L)
+            if ok.any():
+                A = AR[ok]
+                d = np.minimum.reduce([np.hypot(A[:, 0] - p[0], A[:, 1] - p[1])
+                                       for p in (pa, pb)] +
+                                      [np.hypot(A[:, 2] - p[0], A[:, 3] - p[1]) for p in (pa, pb)])
+                if (d <= near_end).any():
+                    return "porte"
+        return None
+
+    def has_jamb(px, py, dx, dy):
+        cx, cy = int(px // cell), int(py // cell)
+        for gx in (cx - 1, cx, cx + 1):
+            for gy in (cy - 1, cy, cy + 1):
+                for qx, qy, vx, vy in ends.get((gx, gy), ()):
+                    if abs(qx - px) > jt or abs(qy - py) > jt:
+                        continue
+                    L = math.hypot(vx, vy) or 1e-9
+                    if abs(vx * dx + vy * dy) / L < 0.5:      # across the face
+                        return True
+        return False
+
+    dash_len, dash_gap = 0.35 * scale, 0.1 * scale
+    order = np.argsort(th, kind="stable")
+    out, fill, kinds = [], [], []
+    breaks = np.nonzero(np.diff(th[order]) > ang_tol)[0] + 1
+    for grp in np.split(order, breaks):
+        if len(grp) < 2:
+            continue
+        g2 = grp[np.argsort(rho[grp], kind="stable")]
+        b2 = np.nonzero(np.diff(rho[g2]) > rho_tol)[0] + 1
+        for line in np.split(g2, b2):
+            if len(line) < 2:
+                continue
+            ln = line[np.argsort(lo[line], kind="stable")]
+            a_th = float(np.mean(th[ln]))
+            a_rho = float(np.mean(rho[ln]))
+            cx, cy = math.cos(a_th), math.sin(a_th)
+            pt = lambda t: (t * cx - a_rho * cy, t * cy + a_rho * cx)
+            # dashed lines (lintels over the openings): short pieces with
+            # short gaps; their gaps are filled, but they are no wall face
+            short = (hi[ln] - lo[ln]) < dash_len
+            dash = np.zeros(len(ln), bool)
+            for k in range(len(ln) - 1):
+                if short[k] and short[k + 1] and 0 <= lo[ln[k + 1]] - hi[ln[k]] < dash_gap:
+                    dash[k] = dash[k + 1] = True
+            end = hi[ln[0]]
+            for j in ln[1:]:
+                gap = lo[j] - end
+                if 0 < gap < dash_gap:
+                    fill.append(pt(end) + pt(lo[j]))
+                end = max(end, hi[j])
+            solid = ln[~dash]
+            if len(solid) < 2:
+                continue
+            end = hi[solid[0]]
+            for j in solid[1:]:
+                s = lo[j]
+                gap = s - end
+                if gmin <= gap <= gmax:
+                    pa, pb = pt(end), pt(s)
+                    if has_jamb(pa[0], pa[1], cx, cy) and has_jamb(pb[0], pb[1], cx, cy):
+                        kind = has_evidence(pa, pb) if need_evidence else "ouverture"
+                        if not kind and gap <= PASSAGE_MAX_M * scale:
+                            kind = "passage"     # open passage between two rooms
+                        if kind:
+                            out.append(pa + pb)
+                            kinds.append(kind)
+                end = max(end, hi[j])
+    return np.array(out, float).reshape(-1, 4), np.array(fill, float).reshape(-1, 4), kinds
+
+
+_AREA_RE = __import__("re").compile(r"^\s*\d+[.,]\d+\s*m(²|2)\s*$")
+
+
+def _room_labels(page, m, zoom):
+    """Pixel positions of the room stamps of the plan ('11.44 m²'): one per
+    room, they tell when two rooms were merged."""
+    out = []
+    try:
+        for b in page.get_text("dict")["blocks"]:
+            for ln in b.get("lines", ()):
+                t = "".join(sp["text"] for sp in ln["spans"])
+                if _AREA_RE.match(t):
+                    r = pymupdf.Rect(ln["bbox"])
+                    c = pymupdf.Point((r.x0 + r.x1) / 2, (r.y0 + r.y1) / 2)
+                    if m is not None:
+                        c = c * m
+                    out.append((int(c.y * zoom), int(c.x * zoom)))
+    except Exception:
+        pass
+    return out
+
+
+def _count_labels(prep, reg, ox, oy):
+    h, w = reg.shape
+    n = 0
+    for y, x in prep.labels:
+        if 0 <= y - oy < h and 0 <= x - ox < w and reg[y - oy, x - ox]:
+            n += 1
+    return n
+
+
+def _runs(prep, which="strong"):
+    if which not in prep.runs:
+        prep.runs[which] = _row_runs(~(prep.mask if which == "strong" else prep.mask_all))
+    return prep.runs[which]
+
+
+def _flood_page(prep, seed, max_px, which="strong"):
+    """Room = free pixels connected to the seed, on the whole page mask.
+    None if it grows over ``max_px`` (not closed)."""
+    free = ~(prep.mask if which == "strong" else prep.mask_all)
+    H, W = free.shape
+    y, x = seed
+    starts, ends = _runs(prep, which)
+    if not free[y, x]:
+        return None
+    i = int(np.searchsorted(ends[y], x, side="right"))
+    stack = [(y, i)]
+    seen = {(y, i)}
+    rows = []
+    total = 0
+    while stack:
+        y, i = stack.pop()
+        s, e = int(starts[y][i]), int(ends[y][i])
+        if y == 0 or y == H - 1 or s == 0 or e == W:
+            return None
+        total += e - s
+        if total > max_px:
+            return None
+        rows.append((y, s, e))
+        for ny in (y - 1, y + 1):
+            st, en = starts[ny], ends[ny]
+            j0 = int(np.searchsorted(en, s, side="right"))
+            j1 = int(np.searchsorted(st, e, side="left"))
+            for j in range(j0, j1):
+                if (ny, j) not in seen:
+                    seen.add((ny, j))
+                    stack.append((ny, j))
+    ys = [r[0] for r in rows]
+    y0, y1 = min(ys), max(ys) + 1
+    x0 = min(r[1] for r in rows)
+    x1 = max(r[2] for r in rows)
+    reg = np.zeros((y1 - y0, x1 - x0), bool)
+    for y, s, e in rows:
+        reg[y - y0, s - x0:e - x0] = True
+    return reg, x0, y0
+
+
+def _flood_closed(prep, seed, px_m):
+    """Fallback for an opening without a bridge (door at a corner...):
+    close the gaps of the mask around the click, growing the gap size."""
+    sy, sx = seed
+    H, W = prep.mask.shape
+    for win_m in (14.0, 30.0):
+        half = int(win_m / px_m / 2)
+        y0, y1 = max(0, sy - half), min(H, sy + half)
+        x0, x1 = max(0, sx - half), min(W, sx + half)
+        sub = prep.mask[y0:y1, x0:x1]
+        for g in (0.3, 0.5, 0.7, 0.95):
+            r = max(1, int(round(g / px_m)))
+            closed = closing(sub, r)
+            if closed[sy - y0, sx - x0]:
+                break
+            reg = flood(~closed, (sy - y0, sx - x0), stop_at_border=True)
+            if reg is not None:
+                ys, xs = np.nonzero(reg)
+                return reg[ys.min():ys.max() + 1, xs.min():xs.max() + 1], x0 + xs.min(), y0 + ys.min()
+    return None
+
+
+def _snap_edges(poly, lines, tol, scale):
+    """Every outline edge is moved onto the drawing line it follows (wall
+    face or bridge): exact lengths and areas, not pixel ones."""
+    n = len(poly)
+    if not len(lines):
+        return poly
+    lx0, ly0, lx1, ly1 = lines.T
+    ldx, ldy = lx1 - lx0, ly1 - ly0
+    lL = np.hypot(ldx, ldy)
+    eqs = []
+    for i in range(n):
+        a, b = poly[i], poly[(i + 1) % n]
+        L = math.dist(a, b)
+        if L < 1e-6:
+            eqs.append(None)
+            continue
+        ux, uy = (b[0] - a[0]) / L, (b[1] - a[1]) / L
+        cross = np.abs(ux * ldy - uy * ldx) / lL
+        d0 = np.abs((lx0 - a[0]) * uy - (ly0 - a[1]) * ux)
+        d1 = np.abs((lx1 - a[0]) * uy - (ly1 - a[1]) * ux)
+        t0 = (lx0 - a[0]) * ux + (ly0 - a[1]) * uy
+        t1 = (lx1 - a[0]) * ux + (ly1 - a[1]) * uy
+        ov = np.minimum(np.maximum(t0, t1), L) - np.maximum(np.minimum(t0, t1), 0)
+        ok = (cross < 0.035) & (d0 < tol) & (d1 < tol) & (ov > np.minimum(0.3 * L, 0.5 * lL))
+        if not ok.any():
+            eqs.append(((a[0] + b[0]) / 2, (a[1] + b[1]) / 2, ux, uy, False))
+            continue
+        idx = np.nonzero(ok)[0]
+        score = ov[idx] - 4 * (d0[idx] + d1[idx])
+        k = idx[int(np.argmax(score))]
+        vx, vy = ldx[k] / lL[k], ldy[k] / lL[k]
+        if vx * ux + vy * uy < 0:
+            vx, vy = -vx, -vy
+        eqs.append((lx0[k], ly0[k], vx, vy, True))
+    out = []
+    for i in range(n):
+        e1, e2 = eqs[i - 1], eqs[i]
+        p = poly[i]
+        if e1 is None or e2 is None:
+            out.append(p)
+            continue
+        q = _intersect(((e1[0], e1[1]), (e1[0] + e1[2], e1[1] + e1[3])),
+                       ((e2[0], e2[1]), (e2[0] + e2[2], e2[1] + e2[3])))
+        if q is None or abs(e1[2] * e2[3] - e1[3] * e2[2]) < 0.05:
+            # (nearly) parallel neighbours: same wall face -> drop the corner
+            if e1[4] and e2[4] and abs((e2[0] - e1[0]) * e1[3] - (e2[1] - e1[1]) * e1[2]) < tol:
+                continue
+            # project the corner onto the snapped edge
+            if e2[4]:
+                t = (p[0] - e2[0]) * e2[2] + (p[1] - e2[1]) * e2[3]
+                q = (e2[0] + t * e2[2], e2[1] + t * e2[3])
+            else:
+                q = p
+        elif math.dist(q, p) > 3 * tol:
+            q = p
+        out.append(q)
+    return out
+
+
+def _clean(poly, min_edge):
+    """Remove zero / tiny edges and collinear points."""
+    pts = list(poly)
+    changed = True
+    while changed and len(pts) > 3:
+        changed = False
+        for i in range(len(pts)):
+            if math.dist(pts[i], pts[(i + 1) % len(pts)]) < min_edge:
+                del pts[(i + 1) % len(pts)]
+                changed = True
+                break
+    return drop_collinear(pts, tol=0.05)
+
+
+def _parallel(e1, e2, tol=0.04):
+    (a, b), (c, d) = e1, e2
+    l1, l2 = math.dist(a, b), math.dist(c, d)
+    if l1 < 1e-9 or l2 < 1e-9:
+        return False
+    return abs((b[0] - a[0]) * (d[1] - c[1]) - (b[1] - a[1]) * (d[0] - c[0])) / (l1 * l2) < tol
+
+
+def _remove_frames(poly, marks, scale):
+    """Door frames / casings jut a few centimetres into the room next to
+    the openings; plans measure the room without them. Steps and bumps of
+    at most 15 cm next to an opening (bridge end or door hinge) are removed."""
+    if not marks:
+        return poly
+    step, near = 0.15 * scale, 0.25 * scale
+
+    def near_mark(p):
+        return any(math.dist(p, m) <= near for m in marks)
+
+    pts = list(poly)
+    for _ in range(12):
+        changed = False
+        for rev in (False, True):
+            if rev:
+                pts.reverse()
+            n = len(pts)
+            if n < 5:
+                break
+            for i in range(n):
+                P = [pts[(i + k) % n] for k in range(-1, 4)]   # p[i-1] .. p[i+3]
+                a, b, c, d = (P[0], P[1]), (P[1], P[2]), (P[2], P[3]), (P[3], P[4])
+                lb, lc = math.dist(*b), math.dist(*c)
+                # step: a, short b, c parallel to a, then d -> extend a to d
+                if lb <= step and lc <= 1.2 * scale and _parallel(a, c) and not _parallel(a, d)                         and (near_mark(P[2]) or near_mark(P[3])):
+                    q = _intersect(a, d)
+                    if q is not None and math.dist(q, P[3]) <= step * 1.5:
+                        idx = sorted({(i + k) % n for k in (0, 1, 2)}, reverse=True)
+                        for k in idx:
+                            del pts[k]
+                        pts.insert(min(idx) if min(idx) < len(pts) + 1 else len(pts), q)
+                        changed = True
+                        break
+            if rev:
+                pts.reverse()
+            if changed:
+                break
+        if not changed:
             break
-        reg = flood(~closed, (sy, sx), stop_at_border=True)
-        if reg is not None:
-            return reg, clip, zoom, walls
-    if all(touches_page):
-        raise RoomError("Pièce non fermée : cliquez bien à l'intérieur d'une pièce fermée "
-                        "par des murs.")
-    raise _Leak()
+    return drop_collinear(pts, tol=0.05)
 
 
 def detect_room(doc, page_no: int, click_xy: tuple[float, float]):
@@ -498,37 +920,105 @@ def detect_room(doc, page_no: int, click_xy: tuple[float, float]):
         raise RoomError("Ce plan n'a pas de calque de murs : la pièce automatique n'est pas "
                         "possible. Utilisez Périmètre ou Surface (clic sur chaque coin), "
                         "les cotes et ouvertures sont alors calculées automatiquement.")
-    cx, cy = click_xy
-    last_error = None
-    for window_m in WINDOWS_M:          # grow the analysed area for big rooms
-        try:
-            region, clip, zoom, walls = _find_region(doc, page_no, cx, cy, scale, window_m)
-            break
-        except _Leak:
-            last_error = RoomError("Pièce non fermée ou trop grande : cliquez bien à l'intérieur "
-                                   "d'une pièce fermée par des murs.")
-    else:
-        raise last_error
-    px_pt = 1.0 / zoom
+    prep = prepare(doc, page_no)
+    z = prep.zoom
+    px_m = 1.0 / (z * scale)
+    H, W = prep.mask.shape
+    sx, sy = int(click_xy[0] * z), int(click_xy[1] * z)
+    if not (0 <= sx < W and 0 <= sy < H):
+        raise RoomError("Cliquez à l'intérieur d'une pièce.")
+    if prep.mask[sy, sx]:
+        # clicked on a line / label: nearest free point within 30 cm
+        r0 = max(2, int(0.3 / px_m))
+        y0, y1, x0, x1 = max(0, sy - r0), min(H, sy + r0), max(0, sx - r0), min(W, sx + r0)
+        ys, xs = np.nonzero(~prep.mask[y0:y1, x0:x1])
+        if len(ys) == 0:
+            raise RoomError("Cliquez à l'intérieur d'une pièce (pas sur un mur).")
+        k = np.argmin((ys + y0 - sy) ** 2 + (xs + x0 - sx) ** 2)
+        sy, sx = int(ys[k] + y0), int(xs[k] + x0)
+    max_px = MAX_ROOM_M2 / (px_m * px_m)
+    found = _flood_page(prep, (sy, sx), max_px)
+    if (found is None or _count_labels(prep, *found) >= 2) and prep.mask_all is not prep.mask             and not prep.mask_all[sy, sx]:
+        # several room stamps inside: open passages between rooms are closed too
+        alt = _flood_page(prep, (sy, sx), max_px, "all")
+        if alt is not None and (found is None or _count_labels(prep, *alt) < _count_labels(prep, *found)):
+            found = alt
+    if found is None:
+        found = _flood_closed(prep, (sy, sx), px_m)
+    if found is None:
+        raise RoomError("Pièce non fermée ou trop grande : cliquez bien à l'intérieur "
+                        "d'une pièce fermée par des murs.")
+    reg, ox, oy = found
+    # padding so the morphology / outline never touch the border
+    pad = 6
+    region = np.zeros((reg.shape[0] + 2 * pad, reg.shape[1] + 2 * pad), bool)
+    region[pad:-pad, pad:-pad] = reg
+    ox, oy = ox - pad, oy - pad
     region = fill_holes(region)
-    # door leaves / swing arcs inside the room: thin slits and pockets
-    px_m = 1.0 / (zoom * scale)
-    region = closing(region, max(1, int(round(0.45 / px_m)))) & ~erode(walls, 1)
+    # door leaves, frames and thin furniture lines stuck to the walls
+    region = fill_holes(closing(region, max(1, int(round(0.06 / px_m)))))
+    region = opening(region, 1)
+    if not region.any():
+        raise RoomError("Contour de pièce introuvable.")
     region = fill_holes(region)
 
     outline = trace_outline(region)
-    poly = simplify(outline, 1.5)
-    poly = drop_collinear(square_up(poly), tol=0.8)
+    poly = simplify(outline, 1.2)
+    poly = [((ox + p[0]) / z, (oy + p[1]) / z) for p in poly]
+    tol = SNAP_TOL_PX / z
+    # candidate lines near the room only
+    xs = [p[0] for p in poly]
+    ys = [p[1] for p in poly]
+    L = prep.lines
+    near = ((np.maximum(L[:, 0], L[:, 2]) > min(xs) - 3 * tol) & (np.minimum(L[:, 0], L[:, 2]) < max(xs) + 3 * tol)
+            & (np.maximum(L[:, 1], L[:, 3]) > min(ys) - 3 * tol) & (np.minimum(L[:, 1], L[:, 3]) < max(ys) + 3 * tol))
+    lines = L[near]
+    poly = drop_collinear(square_up(poly, tol_deg=2.0), tol=0.6 / z)
+    for _ in range(2):
+        poly = _snap_edges(poly, lines, tol, scale)
+        poly = _clean(poly, 0.02 * scale)
+    marks = [tuple(b[:2]) for b in prep.bridges] + [tuple(b[2:]) for b in prep.bridges]
+    cx0, cx1, cy0, cy1 = min(xs) - 50, max(xs) + 50, min(ys) - 50, max(ys) + 50
+    marks = [m for m in marks if cx0 < m[0] < cx1 and cy0 < m[1] < cy1]
+    poly = _remove_frames(poly, marks, scale)
     if len(poly) < 3:
         raise RoomError("Contour de pièce introuvable.")
+    openings = _bridge_openings(prep, poly, scale)
+    return {"polygon": poly, "openings": openings}
 
-    def to_pt(p):
-        return (clip.x0 + p[0] * px_pt, clip.y0 + p[1] * px_pt)
 
-    pts = [to_pt(p) for p in poly]
-    pts = snap_polygon(doc, page_no, pts, 4 * px_pt)
-    openings = find_openings(doc, page_no, pts, layers=True)
-    return {"polygon": pts, "openings": openings}
+def _bridge_openings(prep, pts, scale):
+    """Openings of each side = the bridges (closed doors / windows) lying on
+    it. Door when a swing arc is near, else window."""
+    out = []
+    B = prep.bridges
+    n = len(pts)
+    tol = 0.012 * scale
+    for i in range(n):
+        a, b = pts[i], pts[(i + 1) % n]
+        L = math.dist(a, b)
+        if L < MIN_OPENING_M * scale or not len(B):
+            continue
+        ux, uy = (b[0] - a[0]) / L, (b[1] - a[1]) / L
+        d0 = np.abs((B[:, 0] - a[0]) * uy - (B[:, 1] - a[1]) * ux)
+        d1 = np.abs((B[:, 2] - a[0]) * uy - (B[:, 3] - a[1]) * ux)
+        t0 = (B[:, 0] - a[0]) * ux + (B[:, 1] - a[1]) * uy
+        t1 = (B[:, 2] - a[0]) * ux + (B[:, 3] - a[1]) * uy
+        lo = np.clip(np.minimum(t0, t1), 0, L)
+        hi = np.clip(np.maximum(t0, t1), 0, L)
+        ok = (d0 < tol) & (d1 < tol) & (hi - lo >= MIN_OPENING_M * scale * 0.8)
+        spans = sorted((lo[k], hi[k], prep.kinds[k]) for k in np.nonzero(ok)[0])
+        merged = []
+        for s, e, kind in spans:
+            if merged and s <= merged[-1][1] + 1e-6:
+                merged[-1][1] = max(merged[-1][1], e)
+            else:
+                merged.append([s, e, kind])
+        for s, e, kind in merged:
+            pa = (a[0] + ux * s, a[1] + uy * s)
+            pb = (a[0] + ux * e, a[1] + uy * e)
+            out.append({"edge": i, "a": pa, "b": pb, "kind": kind})
+    return out
 
 
 def snap_polygon(doc, page_no, pts, radius):
@@ -546,6 +1036,8 @@ def find_openings(doc, page_no, pts, layers: bool | None = None):
     scale = doc.scale_points_per_meter or 1.0
     if layers is None:
         layers = has_wall_layers(doc)
+    if layers and doc.scale_points_per_meter:
+        return _bridge_openings(prepare(doc, page_no), pts, scale)
     arcs = []
     if layers:
         # door swings are stroked arcs (on the door layer or the wall layer)

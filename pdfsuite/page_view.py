@@ -39,6 +39,7 @@ MEASURE_TOOLS = {Tool.MEASURE_LINE, Tool.MEASURE_PERIMETER, Tool.MEASURE_AREA, T
                  Tool.ROOM}
 COTE_OFFSET_M = (0.30, 0.65)    # automatic cotes: chain, then overall length
 MIN_COTE_SIDE_M = 0.30          # no automatic cote on shorter sides
+MIN_CHAIN_M = 0.15              # pieces of a cote chain shorter than this are not drawn
 
 
 def _rect_to_quad(r: pymupdf.Rect) -> pymupdf.Quad:
@@ -281,6 +282,29 @@ class PdfGraphicsView(QGraphicsView):
             QGraphicsView.ScrollHandDrag if tool == Tool.PAN else QGraphicsView.NoDrag
         )
         self._show_measure_info(None)
+        if tool == Tool.ROOM:
+            QTimer.singleShot(30, self._prepare_room)
+
+    def _prepare_room(self):
+        """Pièce auto: read the walls of the page once (≈1-2 s on a big
+        plan) when the tool is chosen, so every click is then instant."""
+        if self.tool != Tool.ROOM or not self.page_items or getattr(self, "_closed", False):
+            return
+        from . import room_detect as rd
+        if not self.doc.scale_points_per_meter:
+            return
+        try:
+            if not rd.has_wall_layers(self.doc) or rd.is_prepared(self.doc, self.current_page()):
+                return
+            self.statusMessage.emit("Pièce auto : lecture des murs du plan…")
+            QApplication.setOverrideCursor(Qt.WaitCursor)
+            try:
+                rd.prepare(self.doc, self.current_page())
+            finally:
+                QApplication.restoreOverrideCursor()
+            self.statusMessage.emit("Pièce auto : cliquez dans une pièce.")
+        except Exception:
+            pass
 
     def set_color(self, rgb: tuple[float, float, float]):
         self.current_color = rgb
@@ -1659,14 +1683,7 @@ def _room_methods():
             for t0, t1 in ts:
                 marks += [min(t0, t1), max(t0, t1)]
             marks.append(L)
-            # merge tiny pieces of the chain (< 10 cm) into their neighbour
-            kept = [marks[0]]
-            for t in marks[1:]:
-                if t - kept[-1] >= 0.10 * scale:
-                    kept.append(t)
-                elif t == marks[-1]:
-                    kept[-1] = t
-            marks = kept
+            marks = sorted(set(marks))
 
             def cote(t0, t1, off):
                 pa = QPointF(a[0] + ux * t0, a[1] + uy * t0)
@@ -1677,7 +1694,8 @@ def _room_methods():
 
             if len(marks) > 2:
                 for k in range(len(marks) - 1):
-                    cote(marks[k], marks[k + 1], d1)
+                    if marks[k + 1] - marks[k] >= MIN_CHAIN_M * scale:   # no 2 cm pieces
+                        cote(marks[k], marks[k + 1], d1)
                 cote(0.0, L, d2)
             else:
                 cote(0.0, L, d1)

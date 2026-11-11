@@ -57,6 +57,7 @@ class PdfDocument:
         self._dl_cache = {}
         self._snap_cache = {}
         self._seg_cache = {}
+        self.__dict__.pop("_room_cache", None)
 
     # -- object snapping ----------------------------------------------------
     SNAP_CELL = 24.0     # spatial hash cell, in PDF points
@@ -221,7 +222,9 @@ class PdfDocument:
             self._dl_cache = {}
             self._snap_cache = {}
             self._seg_cache = {}
+            self.__dict__.pop("_room_cache", None)
         else:
+            self.__dict__.pop("_room_cache", None)
             self._dl_cache.pop(index, None)
             getattr(self, "_snap_cache", {}).pop(index, None)
             self._seg_cache = {}
@@ -480,7 +483,8 @@ class PdfDocument:
         s = self.scale_points_per_meter
         if not s:
             return "?"
-        return f"{self._num(points2 / (s * s))} m²"
+        d = max(2, self.decimals)               # 10,29 m², never "10 m²"
+        return f"{points2 / (s * s):.{d}f}".replace(".", ",") + " m²"
 
     @staticmethod
     def poly_perimeter(pts, closed: bool = True) -> float:
