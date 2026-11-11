@@ -386,6 +386,19 @@ def _neutral_dark(rgb, limit=0.6) -> bool:
     return max(r, g, b) - min(r, g, b) < 0.12 and 0.3 * r + 0.59 * g + 0.11 * b < limit
 
 
+def _light_grey(rgb) -> bool:
+    if not rgb:
+        return False
+    if len(rgb) == 1:
+        rgb = (rgb[0],) * 3
+    elif len(rgb) == 4:
+        c, m, y, k = rgb
+        rgb = ((1 - c) * (1 - k), (1 - m) * (1 - k), (1 - y) * (1 - k))
+    r, g, b = rgb[:3]
+    lum = 0.3 * r + 0.59 * g + 0.11 * b
+    return max(r, g, b) - min(r, g, b) < 0.06 and 0.7 <= lum <= 0.95
+
+
 class _Prep:
     pass
 
@@ -397,26 +410,90 @@ def _xf(m):
 
 
 def is_prepared(doc, page_no: int) -> bool:
-    key = (page_no, round(doc.scale_points_per_meter or 0, 4))
-    return key in doc.__dict__.get("_room_cache", {})
+    return _key(doc, page_no) in doc.__dict__.get("_room_cache", {})
+
+
+def _collect(doc, page_no: int) -> dict:
+    """Everything read from MuPDF (main thread only): drawings, room
+    stamps, page geometry. The heavy analysis then runs in _build."""
+    page = doc.page(page_no)
+    labels = []
+    try:
+        for b in page.get_text("dict")["blocks"]:
+            for ln in b.get("lines", ()):
+                t = "".join(sp["text"] for sp in ln["spans"])
+                if _AREA_RE.match(t):
+                    r = pymupdf.Rect(ln["bbox"])
+                    labels.append(((r.x0 + r.x1) / 2, (r.y0 + r.y1) / 2))
+    except Exception:
+        pass
+    try:
+        drawings = page.get_cdrawings()
+    except Exception:
+        drawings = []
+    return {"scale": doc.scale_points_per_meter,
+            "m": ~page.derotation_matrix if page.rotation else None,
+            "size": doc.visual_size(page_no), "drawings": drawings, "labels": labels}
+
+
+def _key(doc, page_no):
+    return (page_no, round(doc.scale_points_per_meter or 0, 4))
+
+
+def prepare_async(doc, page_no: int):
+    """Starts reading the walls in the background (file opened, tool
+    chosen): the first click then finds it ready. MuPDF is only used here,
+    in the calling (main) thread; the analysis runs in a worker thread."""
+    import threading
+    if not doc.scale_points_per_meter or not has_wall_layers(doc):
+        return
+    cache = doc.__dict__.setdefault("_room_cache", {})
+    pending = doc.__dict__.setdefault("_room_pending", {})
+    key = _key(doc, page_no)
+    if key in cache or key in pending:
+        return
+    data = _collect(doc, page_no)
+
+    def work():
+        try:
+            prep = _build(data)
+            cache.clear()
+            cache[key] = prep
+        except Exception:
+            pass
+        finally:
+            pending.pop(key, None)
+
+    t = threading.Thread(target=work, daemon=True)
+    pending[key] = t
+    t.start()
 
 
 def prepare(doc, page_no: int):
     """Wall lines, door / window bridges and a wall mask of the whole page,
     cached on the document (≈1-2 s on a big plan, done once)."""
-    scale = doc.scale_points_per_meter
     cache = doc.__dict__.setdefault("_room_cache", {})
-    key = (page_no, round(scale or 0, 4))
+    key = _key(doc, page_no)
+    t = doc.__dict__.get("_room_pending", {}).get(key)
+    if t is not None:
+        t.join()                       # already being read in the background
     prep = cache.get(key)
     if prep is not None:
         return prep
+    prep = _build(_collect(doc, page_no))
+    cache.clear()                      # one page at a time is enough
+    cache[key] = prep
+    return prep
+
+
+def _build(data: dict):
     from PySide6.QtCore import QLineF, QPointF, Qt
     from PySide6.QtGui import QImage, QPainter, QPainterPath, QPen, QBrush, QColor, QPolygonF
 
-    page = doc.page(page_no)
-    m = ~page.derotation_matrix if page.rotation else None
+    scale = data["scale"]
+    m = data["m"]
     T = _xf(m)
-    w_pts, h_pts = doc.visual_size(page_no)
+    w_pts, h_pts = data["size"]
     zoom = 1.0 / (PREP_PX_M * scale)
     zoom = min(zoom, math.sqrt(MAX_PREP_PX / max(1.0, w_pts * h_pts)))
     W, H = int(w_pts * zoom) + 2, int(h_pts * zoom) + 2
@@ -425,20 +502,49 @@ def prepare(doc, page_no: int):
     qp = QPainter(img)
     qp.setRenderHint(QPainter.Antialiasing, False)
     qp.scale(zoom, zoom)
-    P = lambda p: QPointF(*T(p))
+    if m is None:
+        T = lambda p: (p[0], p[1])
     segs, arcs, ev_lines, ev_arcs, ev_circ = [], [], [], [], []
     min_len = 0.015 * scale
+    layer_kind = {}                  # layer name -> (is_wall, is_open), computed once
+    dark_c, grey_c = {}, {}          # colour -> bool, computed once
+
+    def dark(c):
+        k = tuple(c) if c else None
+        v = dark_c.get(k)
+        if v is None:
+            v = dark_c[k] = _neutral_dark(c)
+        return v
+
+    def grey(c):
+        k = tuple(c) if c else None
+        v = grey_c.get(k)
+        if v is None:
+            v = grey_c[k] = _light_grey(c)
+        return v
+
+    import time as _time
+    tick = _time.time()
     # painted in drawing order, as on screen: the hatching of the walls is
     # long lines hidden afterwards by white fills, they must stay hidden
-    for path in page.get_cdrawings():
-        lname = _norm(path.get("layer"))
-        is_wall = _is_wall_layer(lname)
-        is_open = _is_opening_layer(lname)
+    for path in data["drawings"]:
+        if _time.time() - tick > 0.02:        # let the window breathe (background)
+            _time.sleep(0)
+            tick = _time.time()
+        lname = path.get("layer") or ""
+        kind = layer_kind.get(lname)
+        if kind is None:
+            n_ = _norm(lname)
+            kind = layer_kind[lname] = (_is_wall_layer(n_), _is_opening_layer(n_))
+        is_wall, is_open = kind
         if not (is_wall or is_open):
             continue
         items = path.get("items", ())
+        ptype = path["type"]
+        stroked = "s" in ptype
         for it in items:
-            if it[0] == "c" and "s" in path["type"]:      # door swing arcs
+            op = it[0]
+            if op == "c" and stroked:                    # door swing arcs
                 a, b = T(it[1]), T(it[4])
                 arcs.append(((a[0] + b[0]) / 2, (a[1] + b[1]) / 2, math.dist(a, b)))
                 ev_arcs.append((a, b))
@@ -450,57 +556,60 @@ def prepare(doc, page_no: int):
                     r = (math.dist(q, a) + math.dist(q, b)) / 2
                     if abs(math.dist(q, a) - math.dist(q, b)) < 0.1 * r:
                         ev_circ.append((q[0], q[1], r))
-            elif is_open and it[0] == "l":
+            elif is_open and op == "l":
                 ev_lines.append(T(it[1]) + T(it[2]))
-            elif is_open and it[0] == "re":
-                r = pymupdf.Rect(it[1])
-                c = [T((r.x0, r.y0)), T((r.x1, r.y0)), T((r.x1, r.y1)), T((r.x0, r.y1))]
+            elif is_open and op == "re":
+                r = it[1]
+                c = [T((r[0], r[1])), T((r[2], r[1])), T((r[2], r[3])), T((r[0], r[3]))]
                 ev_lines += [c[i] + c[(i + 1) % 4] for i in range(4)]
         if not is_wall:
             continue
+        # a block filled light grey (WC frame, appliance, furniture) is not a
+        # wall, even with a black outline: the room goes under it
+        filled = "f" in ptype
+        furn = filled and grey(path.get("fill"))
         qpath = QPainterPath()
+        last = None
         for it in items:
             op = it[0]
             if op == "l":
-                a, b = P(it[1]), P(it[2])
-                if qpath.elementCount() == 0 or qpath.currentPosition() != a:
-                    qpath.moveTo(a)
-                qpath.lineTo(b)
-                pairs = [(T(it[1]), T(it[2]))]
-            elif op == "c":
-                if "f" not in path["type"]:
-                    continue                 # stroked arcs: door swings, not walls
-                a = P(it[1])
-                if qpath.elementCount() == 0 or qpath.currentPosition() != a:
-                    qpath.moveTo(a)
-                qpath.cubicTo(P(it[2]), P(it[3]), P(it[4]))
-                continue
-            elif op == "re":
-                r = pymupdf.Rect(it[1])
-                c = [T((r.x0, r.y0)), T((r.x1, r.y0)), T((r.x1, r.y1)), T((r.x0, r.y1))]
-                qpath.addPolygon(QPolygonF([QPointF(*p) for p in c]))
-                qpath.closeSubpath()
-                pairs = [(c[i], c[(i + 1) % 4]) for i in range(4)]
-            elif op == "qu":
-                q = it[1]
-                c = [T(q[0]), T(q[1]), T(q[3]), T(q[2])]
-                qpath.addPolygon(QPolygonF([QPointF(*p) for p in c]))
-                qpath.closeSubpath()
-                pairs = [(c[i], c[(i + 1) % 4]) for i in range(4)]
-            else:
-                continue
-            for a, b in pairs:
-                if math.dist(a, b) >= min_len:
+                a, b = T(it[1]), T(it[2])
+                if last != a:
+                    qpath.moveTo(a[0], a[1])
+                qpath.lineTo(b[0], b[1])
+                last = b
+                if not furn:
                     segs.append((a[0], a[1], b[0], b[1]))
+            elif op == "c":
+                if not filled:
+                    continue                 # stroked arcs: door swings, not walls
+                a = T(it[1])
+                if last != a:
+                    qpath.moveTo(a[0], a[1])
+                c1, c2, b = T(it[2]), T(it[3]), T(it[4])
+                qpath.cubicTo(c1[0], c1[1], c2[0], c2[1], b[0], b[1])
+                last = b
+            elif op in ("re", "qu"):
+                if op == "re":
+                    r = it[1]
+                    c = [T((r[0], r[1])), T((r[2], r[1])), T((r[2], r[3])), T((r[0], r[3]))]
+                else:
+                    q = it[1]
+                    c = [T(q[0]), T(q[1]), T(q[3]), T(q[2])]
+                qpath.addPolygon(QPolygonF([QPointF(x, y) for x, y in c]))
+                qpath.closeSubpath()
+                last = None
+                if not furn:
+                    segs += [(c[i][0], c[i][1], c[(i + 1) % 4][0], c[(i + 1) % 4][1]) for i in range(4)]
         if path.get("closePath"):
             qpath.closeSubpath()
         qpath.setFillRule(Qt.OddEvenFill if path.get("even_odd") else Qt.WindingFill)
-        if "f" in path["type"]:
-            g = 0 if _neutral_dark(path.get("fill")) else 255   # light fill: floor, furniture
+        if filled:
+            g = 0 if dark(path.get("fill")) else 255   # light fill: floor, furniture
             qp.fillPath(qpath, QBrush(QColor(g, g, g)))
-        if "s" in path["type"]:
+        if stroked and not furn:
             col = path.get("color")
-            if _neutral_dark(col):
+            if dark(col):
                 pen = QPen(QColor(0, 0, 0), 2.0)
             elif _gray(col).red() > 200:
                 pen = QPen(QColor(255, 255, 255), 1.0)  # white lines erase
@@ -513,6 +622,8 @@ def prepare(doc, page_no: int):
                         count=img.bytesPerLine() * H).reshape(H, img.bytesPerLine())[:, :W]
     mask = arr < 128
     segs = np.array(segs, float).reshape(-1, 4)
+    if len(segs):
+        segs = segs[np.hypot(segs[:, 2] - segs[:, 0], segs[:, 3] - segs[:, 1]) >= min_len]
     segs = _visible(segs, mask, zoom)
     bridges, fillers, kinds = _bridges(segs, scale, (ev_lines, ev_circ))
     closers = np.vstack([bridges, fillers])
@@ -541,7 +652,11 @@ def prepare(doc, page_no: int):
     prep.zoom = zoom
     prep.mask = mask_strong
     prep.mask_all = mask_all
-    prep.labels = _room_labels(page, m, zoom)
+    prep.labels = []
+    for x, y in data["labels"]:
+        if m is not None:
+            x, y = tuple(pymupdf.Point(x, y) * m)
+        prep.labels.append((int(y * zoom), int(x * zoom)))
     prep.segs = segs
     prep.bridges = bridges
     prep.kinds = kinds
@@ -550,8 +665,7 @@ def prepare(doc, page_no: int):
     prep.ev_arcs = ev_arcs
     prep.scale = scale
     prep.runs = {}
-    cache.clear()                      # one page at a time is enough
-    cache[key] = prep
+    _runs(prep)                        # flood tables ready before the first click
     return prep
 
 

@@ -286,23 +286,15 @@ class PdfGraphicsView(QGraphicsView):
             QTimer.singleShot(30, self._prepare_room)
 
     def _prepare_room(self):
-        """Pièce auto: read the walls of the page once (≈1-2 s on a big
-        plan) when the tool is chosen, so every click is then instant."""
-        if self.tool != Tool.ROOM or not self.page_items or getattr(self, "_closed", False):
+        """Pièce auto: the walls of the page are read in the background (file
+        opened, tool chosen), so the clicks are instant and nothing freezes."""
+        if not self.page_items or getattr(self, "_closed", False):
             return
-        from . import room_detect as rd
         if not self.doc.scale_points_per_meter:
             return
+        from . import room_detect as rd
         try:
-            if not rd.has_wall_layers(self.doc) or rd.is_prepared(self.doc, self.current_page()):
-                return
-            self.statusMessage.emit("Pièce auto : lecture des murs du plan…")
-            QApplication.setOverrideCursor(Qt.WaitCursor)
-            try:
-                rd.prepare(self.doc, self.current_page())
-            finally:
-                QApplication.restoreOverrideCursor()
-            self.statusMessage.emit("Pièce auto : cliquez dans une pièce.")
+            rd.prepare_async(self.doc, self.current_page())
         except Exception:
             pass
 
@@ -479,6 +471,7 @@ class PdfGraphicsView(QGraphicsView):
             self._add_form_widgets()
         self._update_visible()
         QTimer.singleShot(400, self._prepare_snap)
+        QTimer.singleShot(900, self._prepare_room)
 
     def _update_scene_rect(self):
         """Pages + a margin of one screen on each side: lets the view keep
