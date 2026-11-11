@@ -369,6 +369,7 @@ MAX_PREP_PX = 45e6          # mask size limit (pixels)
 BRIDGE_MIN_M, BRIDGE_MAX_M = 0.2, 4.6   # door / window widths closed by a bridge
 MAX_ROOM_M2 = 400.0
 PASSAGE_MAX_M = 2.0         # open passage (no door) closed between wall ends
+THIN_M = 0.24              # strips narrower than this are not part of a room
 SNAP_TOL_PX = 3.5           # outline edge -> drawing line distance (mask pixels)
 
 
@@ -538,6 +539,7 @@ def prepare(doc, page_no: int):
     prep.kinds = kinds
     prep.lines = np.vstack([segs, closers])
     prep.arcs = arcs
+    prep.ev_arcs = ev_arcs
     prep.scale = scale
     prep.runs = {}
     cache.clear()                      # one page at a time is enough
@@ -624,7 +626,10 @@ def _bridges(segs: np.ndarray, scale: float, evidence=((), ())):
         return None
 
     def has_jamb(px, py, dx, dy):
+        """Far ends of the jamb lines leaving (px, py) across the face
+        (empty list = no jamb)."""
         cx, cy = int(px // cell), int(py // cell)
+        found = []
         for gx in (cx - 1, cx, cx + 1):
             for gy in (cy - 1, cy, cy + 1):
                 for qx, qy, vx, vy in ends.get((gx, gy), ()):
@@ -632,8 +637,8 @@ def _bridges(segs: np.ndarray, scale: float, evidence=((), ())):
                         continue
                     L = math.hypot(vx, vy) or 1e-9
                     if abs(vx * dx + vy * dy) / L < 0.5:      # across the face
-                        return True
-        return False
+                        found.append((qx + vx, qy + vy))
+        return found
 
     dash_len, dash_gap = 0.35 * scale, 0.1 * scale
     order = np.argsort(th, kind="stable")
@@ -674,13 +679,23 @@ def _bridges(segs: np.ndarray, scale: float, evidence=((), ())):
                 gap = s - end
                 if gmin <= gap <= gmax:
                     pa, pb = pt(end), pt(s)
-                    if has_jamb(pa[0], pa[1], cx, cy) and has_jamb(pb[0], pb[1], cx, cy):
+                    ja, jb = has_jamb(pa[0], pa[1], cx, cy), has_jamb(pb[0], pb[1], cx, cy)
+                    if ja and jb:
                         kind = has_evidence(pa, pb) if need_evidence else "ouverture"
                         if not kind and gap <= PASSAGE_MAX_M * scale:
                             kind = "passage"     # open passage between two rooms
                         if kind:
                             out.append(pa + pb)
                             kinds.append(kind)
+                            # same opening on the other face of the wall: the
+                            # far ends of both jambs, if they face each other
+                            for qa in ja:
+                                for qb in jb:
+                                    if (abs(math.dist(qa, qb) - gap) <= 0.03 * scale
+                                            and abs(math.dist(qa, pa) - math.dist(qb, pb)) <= 0.03 * scale
+                                            and math.dist(qa, pa) <= 0.6 * scale):
+                                        out.append(tuple(qa) + tuple(qb))
+                                        kinds.append(kind)
                 end = max(end, hi[j])
     return np.array(out, float).reshape(-1, 4), np.array(fill, float).reshape(-1, 4), kinds
 
@@ -866,13 +881,49 @@ def _parallel(e1, e2, tol=0.04):
     return abs((b[0] - a[0]) * (d[1] - c[1]) - (b[1] - a[1]) * (d[0] - c[0])) / (l1 * l2) < tol
 
 
+def _restore_wedges(full, kept):
+    """The thin cut also removes sharp corners of the room (slanted walls).
+    A removed piece is given back when it touches the room along a long
+    side (a corner), not through a narrow neck (inside of a wall)."""
+    removed = full & ~kept
+    if not removed.any():
+        return kept
+    out = kept.copy()
+    touch = dilate(kept, 1)
+    todo = removed.copy()
+    for _ in range(400):
+        ys, xs = np.nonzero(todo)
+        if not len(ys):
+            break
+        comp = flood(todo, (int(ys[0]), int(xs[0])))
+        todo &= ~comp
+        cy, cx = np.nonzero(comp)
+        side = max(cy.max() - cy.min(), cx.max() - cx.min()) + 1
+        contact = int((comp & touch).sum())
+        if contact >= 0.5 * side:
+            out |= comp
+    return out
+
+
+def _line_dist(p, seg):
+    (a, b) = seg
+    L = math.dist(a, b) or 1e-9
+    return abs((p[0] - a[0]) * (b[1] - a[1]) - (p[1] - a[1]) * (b[0] - a[0])) / L
+
+
+def _area(pts):
+    n = len(pts)
+    return abs(sum(pts[i][0] * pts[(i + 1) % n][1] - pts[(i + 1) % n][0] * pts[i][1]
+                   for i in range(n))) / 2
+
+
 def _remove_frames(poly, marks, scale):
     """Door frames / casings jut a few centimetres into the room next to
     the openings; plans measure the room without them. Steps and bumps of
     at most 15 cm next to an opening (bridge end or door hinge) are removed."""
     if not marks:
         return poly
-    step, near = 0.15 * scale, 0.25 * scale
+    step, near, reveal = 0.15 * scale, 0.25 * scale, 0.6 * scale
 
     def near_mark(p):
         return any(math.dist(p, m) <= near for m in marks)
@@ -900,6 +951,22 @@ def _remove_frames(poly, marks, scale):
                         pts.insert(min(idx) if min(idx) < len(pts) + 1 else len(pts), q)
                         changed = True
                         break
+                # reveal of a door / window left open: a, out b, c, back d, e on
+                # the line of a -> the wall face goes straight on
+                if n >= 6 and i + 1 < n:
+                    Q = [pts[(i + k) % n] for k in range(-1, 5)]  # p[i-1] .. p[i+4]
+                    a, b, c, d, e = [(Q[k], Q[k + 1]) for k in range(5)]
+                    lb, ld, lc = math.dist(*b), math.dist(*d), math.dist(*c)
+                    if (lb <= reveal and ld <= reveal and lc <= 2.8 * scale and abs(lb - ld) <= step
+                            and _parallel(a, c) and _parallel(a, e)
+                            and _line_dist(Q[4], a) <= 0.03 * scale
+                            and (near_mark(Q[2]) or near_mark(Q[3]) or near_mark(Q[1]) or near_mark(Q[4]))):
+                        trial = [p for k, p in enumerate(pts)
+                                 if k not in {(i + j) % n for j in (0, 1, 2, 3)}]
+                        if len(trial) >= 3 and _area(trial) < _area(pts):   # outward only
+                            pts = trial
+                            changed = True
+                            break
             if rev:
                 pts.reverse()
             if changed:
@@ -954,6 +1021,21 @@ def detect_room(doc, page_no: int, click_xy: tuple[float, float]):
     region = np.zeros((reg.shape[0] + 2 * pad, reg.shape[1] + 2 * pad), bool)
     region[pad:-pad, pad:-pad] = reg
     ox, oy = ox - pad, oy - pad
+    # thin strips reached through an opening (inside of a wall between its
+    # faces / hatch lines): the room never goes there
+    r_thin = max(1, int(round(THIN_M / 2 / px_m)))
+    full = region
+    thin_cut = opening(region, r_thin)
+    seed = (sy - oy, sx - ox)
+    if thin_cut[seed]:
+        region = flood(thin_cut, seed)
+    elif thin_cut.any():
+        ys_, xs_ = np.nonzero(thin_cut)
+        k = np.argmin((ys_ - seed[0]) ** 2 + (xs_ - seed[1]) ** 2)
+        region = flood(thin_cut, (int(ys_[k]), int(xs_[k])))
+    # back to the exact pixels of the room (the opening rounds the corners)
+    region = full & dilate(region, r_thin + 1)
+    region = _restore_wedges(full, region)
     region = fill_holes(region)
     # door leaves, frames and thin furniture lines stuck to the walls
     region = fill_holes(closing(region, max(1, int(round(0.06 / px_m)))))
@@ -978,6 +1060,7 @@ def detect_room(doc, page_no: int, click_xy: tuple[float, float]):
         poly = _snap_edges(poly, lines, tol, scale)
         poly = _clean(poly, 0.02 * scale)
     marks = [tuple(b[:2]) for b in prep.bridges] + [tuple(b[2:]) for b in prep.bridges]
+    marks += [p for a, b in prep.ev_arcs for p in (a, b)]
     cx0, cx1, cy0, cy1 = min(xs) - 50, max(xs) + 50, min(ys) - 50, max(ys) + 50
     marks = [m for m in marks if cx0 < m[0] < cx1 and cy0 < m[1] < cy1]
     poly = _remove_frames(poly, marks, scale)

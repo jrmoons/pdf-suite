@@ -12,7 +12,7 @@ if not exist ".venv\Scripts\python.exe" (
 if not exist "dist\PDFSuite\PDFSuite.exe" (
     echo Construction de PDFSuite.exe, patientez 1 a 2 minutes ...
     ".venv\Scripts\pip" install pyinstaller || goto :erreur
-    ".venv\Scripts\pyinstaller" --noconfirm --onedir --windowed --name PDFSuite launcher.py || goto :erreur
+    ".venv\Scripts\pyinstaller" --noconfirm --onedir --windowed --name PDFSuite --icon pdfsuite\logo.ico --add-data "pdfsuite\logo.ico;pdfsuite" --add-data "pdfsuite\logo.png;pdfsuite" launcher.py || goto :erreur
 )
 
 powershell -NoProfile -ExecutionPolicy Bypass -Command ^

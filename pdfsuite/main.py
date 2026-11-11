@@ -21,9 +21,28 @@ def install_french(app):
             break
 
 
+def app_icon():
+    """Logo of the application (window, taskbar)."""
+    import os
+    from PySide6.QtGui import QIcon
+    here = os.path.dirname(os.path.abspath(__file__))
+    for name in ("logo.ico", "logo.png"):
+        path = os.path.join(here, name)
+        if os.path.exists(path):
+            return QIcon(path)
+    return QIcon()
+
+
 def main():
+    if sys.platform == "win32":
+        try:   # own taskbar icon, not the Python one
+            import ctypes
+            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("PDFSuite.App")
+        except Exception:
+            pass
     app = QApplication(sys.argv)
     app.setApplicationName("PDF Suite")
+    app.setWindowIcon(app_icon())
     install_french(app)
     win = MainWindow()
     win.show()
