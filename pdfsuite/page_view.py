@@ -35,7 +35,7 @@ BASE_MAX_PX = 2600        # longest side of a page's base image
 DETAIL_DELAY_MS = 120     # pause before the sharp tile is rendered
 MIN_ZOOM, MAX_ZOOM = 0.05, 16.0
 RULER = 22                # ruler thickness in pixels
-MEASURE_TOOLS = {Tool.MEASURE_LINE, Tool.MEASURE_PERIMETER, Tool.MEASURE_AREA}
+MEASURE_TOOLS = {Tool.MEASURE_LINE, Tool.MEASURE_PERIMETER, Tool.MEASURE_AREA, Tool.DIMENSION}
 
 
 def _rect_to_quad(r: pymupdf.Rect) -> pymupdf.Quad:
@@ -197,6 +197,7 @@ class PdfGraphicsView(QGraphicsView):
     cursorInfo = Signal(str)          # coordonnées sous le curseur
     scaleRequired = Signal()          # mesure tentée sans échelle
     scaleCalibrated = Signal()
+    filesDropped = Signal(list)       # PDF glissés sur la vue
 
     scene_scale = 1.0                 # scene units = PDF points
 
@@ -249,6 +250,11 @@ class PdfGraphicsView(QGraphicsView):
         self._detail_timer = QTimer(self)
         self._detail_timer.setSingleShot(True)
         self._detail_timer.timeout.connect(self._render_pending)
+        self._mid_pan = None              # middle-button panning state
+        self._dim = None                  # dimension (cote) being placed
+        self._text_edit_info = {}
+        self.setAcceptDrops(True)
+        self.viewport().setAcceptDrops(True)
 
         self.verticalScrollBar().valueChanged.connect(self._on_scrolled)
         self.horizontalScrollBar().valueChanged.connect(self._on_scrolled)
@@ -260,6 +266,8 @@ class PdfGraphicsView(QGraphicsView):
     def set_tool(self, tool: Tool):
         if self.tool in POLY_TOOLS and tool != self.tool:
             self._cancel_polygon()
+        if tool != Tool.DIMENSION:
+            self._cancel_dimension()
         if tool not in MEASURE_TOOLS:
             self.calibrating = False
         self.tool = tool
@@ -278,6 +286,65 @@ class PdfGraphicsView(QGraphicsView):
         self.setBackgroundBrush(QBrush(surround_color))
         self._hruler.update()
         self._vruler.update()
+
+    # -- hardware acceleration ---------------------------------------------
+    def set_gpu(self, enabled: bool) -> bool:
+        """Draw the view through the graphics card (OpenGL). Returns
+        whether it is active. Falls back silently to software drawing."""
+        if enabled == isinstance(self.viewport(), _gl_widget_class()):
+            return enabled
+        if enabled:
+            cls = _gl_widget_class()
+            if cls is None or QApplication.platformName() in ("offscreen", "minimal"):
+                return False
+            try:
+                vp = cls()
+                fmt = vp.format()
+                fmt.setSamples(4)
+                vp.setFormat(fmt)
+                self.setViewport(vp)
+                self.setViewportUpdateMode(QGraphicsView.FullViewportUpdate)
+            except Exception:
+                return False
+        else:
+            self.setViewport(QWidget())
+            self.setViewportUpdateMode(QGraphicsView.SmartViewportUpdate)
+        self.viewport().setMouseTracking(True)
+        self.viewport().setAcceptDrops(True)
+        # the old viewport was deleted together with its child widgets
+        self._measure_info = MeasureInfo(self)
+        self._place_rulers()
+        self._hruler.raise_()
+        self._vruler.raise_()
+        return enabled
+
+    # -- drag & drop of PDF files ----------------------------------------
+    @staticmethod
+    def _pdf_paths(mime) -> list[str]:
+        if not mime.hasUrls():
+            return []
+        return [u.toLocalFile() for u in mime.urls()
+                if u.isLocalFile() and u.toLocalFile().lower().endswith(".pdf")]
+
+    def dragEnterEvent(self, event):
+        if self._pdf_paths(event.mimeData()):
+            event.acceptProposedAction()
+        else:
+            super().dragEnterEvent(event)
+
+    def dragMoveEvent(self, event):
+        if self._pdf_paths(event.mimeData()):
+            event.acceptProposedAction()
+        else:
+            super().dragMoveEvent(event)
+
+    def dropEvent(self, event):
+        paths = self._pdf_paths(event.mimeData())
+        if paths:
+            event.acceptProposedAction()
+            self.filesDropped.emit(paths)
+        else:
+            super().dropEvent(event)
 
     # -- rulers ---------------------------------------------------------
     def set_rulers(self, visible: bool):
@@ -508,10 +575,12 @@ class PdfGraphicsView(QGraphicsView):
             qpix = QPixmap.fromImage(img)
         return qpix
 
-    def refresh_page(self, n: int):
-        """Re-render one page (its content changed: text edit, signature)."""
+    def refresh_page(self, n: int, content_changed: bool = False):
+        """Re-render one page (``content_changed``: text edit, signature)."""
         if 0 <= n < len(self.page_items):
             item = self.page_items[n]
+            if content_changed:
+                self.doc.invalidate_render(n)
             bz = self._base_zoom_for(n)
             item.base = self._to_qpixmap(self.doc.render_page(n, bz))
             item.base_zoom = bz
@@ -562,8 +631,7 @@ class PdfGraphicsView(QGraphicsView):
             local = local.adjusted(-margin, -margin, margin, margin).intersected(
                 QRectF(QPointF(0, 0), item.size))
             clip = pymupdf.Rect(local.left(), local.top(), local.right(), local.bottom())
-            pix = self.doc.page(item.page_no).get_pixmap(
-                matrix=pymupdf.Matrix(rz, rz), clip=clip, alpha=False, annots=False)
+            pix = self.doc.render_clip(item.page_no, rz, clip)
             item.detail = self._to_qpixmap(pix)
             item.detail_rect = QRectF(clip.x0, clip.y0, pix.width / rz, pix.height / rz)
             item.detail_zoom = rz
@@ -690,6 +758,15 @@ class PdfGraphicsView(QGraphicsView):
         return False
 
     def mousePressEvent(self, event):
+        if event.button() == Qt.MiddleButton:
+            self._mid_pan = (event.pos(), self.horizontalScrollBar().value(),
+                             self.verticalScrollBar().value())
+            self.viewport().setCursor(Qt.ClosedHandCursor)
+            event.accept()
+            return
+        if self.tool == Tool.DIMENSION:
+            self._dimension_press(event)
+            return
         if self.tool in POLY_TOOLS:
             if event.button() == Qt.LeftButton and not self._poly_points and not self._require_scale():
                 return
@@ -756,9 +833,19 @@ class PdfGraphicsView(QGraphicsView):
         super().mousePressEvent(event)
 
     def mouseMoveEvent(self, event):
+        if self._mid_pan is not None:
+            start, h, v = self._mid_pan
+            d = event.pos() - start
+            self.horizontalScrollBar().setValue(h - d.x())
+            self.verticalScrollBar().setValue(v - d.y())
+            event.accept()
+            return
         self._emit_cursor_info(event.pos())
         if self.loupe_enabled:
             self._update_loupe(event.pos())
+        if self.tool == Tool.DIMENSION and self._dim is not None:
+            self._dimension_move(event)
+            return
         if self.tool in POLY_TOOLS and self._poly_points:
             item = self.page_items[self._poly_page]
             scene_pos = self._constrain(item, self._poly_points[-1],
@@ -779,6 +866,14 @@ class PdfGraphicsView(QGraphicsView):
             self._show_measure_info([self._drag_start_pt, pdf_pt], "line", item)
 
     def mouseReleaseEvent(self, event):
+        if event.button() == Qt.MiddleButton and self._mid_pan is not None:
+            self._mid_pan = None
+            self.viewport().unsetCursor()
+            event.accept()
+            return
+        if self.tool == Tool.DIMENSION:
+            self._dimension_release(event)
+            return
         if not self._dragging:
             super().mouseReleaseEvent(event)
             return
@@ -921,6 +1016,9 @@ class PdfGraphicsView(QGraphicsView):
                 self._poly_points.pop()
                 self._update_poly_preview()
                 return
+        if event.key() == Qt.Key_Escape and self._dim is not None:
+            self._cancel_dimension()
+            return
         if event.key() == Qt.Key_Escape and self.tool != Tool.SELECT:
             self.requestSelectTool.emit()
             return
@@ -1069,15 +1167,28 @@ class PdfGraphicsView(QGraphicsView):
                     for span in line["spans"]
                 )
                 fontsize = 12.0
+                text = "\n".join("".join(sp["text"] for sp in line["spans"])
+                                 for line in block["lines"])
                 if block["lines"] and block["lines"][0]["spans"]:
-                    fontsize = block["lines"][0]["spans"][0].get("size", 12.0)
+                    span = block["lines"][0]["spans"][0]
+                    fontsize = span.get("size", 12.0)
+                    c = span.get("color", 0)
+                    self._text_edit_info[(page_no, tuple(round(v, 2) for v in bbox))] = {
+                        "origin": span.get("origin"),
+                        "dir": block["lines"][0].get("dir", (1.0, 0.0)),
+                        "color": (((c >> 16) & 255) / 255, ((c >> 8) & 255) / 255, (c & 255) / 255),
+                    }
                 self.requestTextEdit.emit(page_no, bbox, text, fontsize)
                 return
         self.statusMessage.emit("Aucun bloc de texte à cet endroit.")
 
     def apply_text_edit(self, page_no: int, bbox, new_text: str, fontsize: float):
-        self.doc.replace_text_in_rect(page_no, bbox, new_text, fontsize)
-        self.refresh_page(page_no)
+        info = self._text_edit_info.get((page_no, tuple(round(v, 2) for v in bbox)), {})
+        self.doc.replace_text_in_rect(page_no, bbox, new_text, fontsize,
+                                      color=info.get("color", (0, 0, 0)),
+                                      origin=info.get("origin"),
+                                      direction=info.get("dir", (1.0, 0.0)))
+        self.refresh_page(page_no, content_changed=True)
         self.documentModified.emit()
 
     def place_signature_image(self, page_no: int, pdf_pt, png_bytes: bytes,
@@ -1088,7 +1199,7 @@ class PdfGraphicsView(QGraphicsView):
                             pdf_pt.x + width_pt, pdf_pt.y + width_pt * aspect)
         page.insert_image(rect, stream=png_bytes, keep_proportion=True)
         self.doc.mark_dirty()
-        self.refresh_page(page_no)
+        self.refresh_page(page_no, content_changed=True)
         self.documentModified.emit()
 
     # -- cursor coordinates -----------------------------------------------
@@ -1131,9 +1242,16 @@ class PdfGraphicsView(QGraphicsView):
             self._loupe.setStyleSheet("border: 2px solid #2f6fed; background: white;")
         h = self.LOUPE_SRC
         src = QRect(viewport_pos.x() - h, viewport_pos.y() - h, 2 * h, 2 * h)
-        grab = self.viewport().grab(src)
         size = int(2 * h * self.LOUPE_FACTOR)
-        self._loupe.setPixmap(grab.scaled(size, size, Qt.KeepAspectRatio, Qt.SmoothTransformation))
+        # re-render the area (works with the GPU viewport, unlike grab())
+        pix = QPixmap(size, size)
+        pix.fill(self.backgroundBrush().color())
+        painter = QPainter(pix)
+        painter.setRenderHint(QPainter.SmoothPixmapTransform)
+        painter.setRenderHint(QPainter.Antialiasing)
+        self.render(painter, QRectF(0, 0, size, size), src)
+        painter.end()
+        self._loupe.setPixmap(pix)
         self._loupe.resize(size + 4, size + 4)
         gpos = self.viewport().mapToGlobal(viewport_pos)
         self._loupe.move(gpos.x() + 24, gpos.y() + 24)
@@ -1210,3 +1328,129 @@ class PdfGraphicsView(QGraphicsView):
         x0 = end.x if end.x >= target.x else end.x - w
         box = pymupdf.Rect(x0, end.y - h / 2, x0 + w, end.y + h / 2)
         self.doc.add_callout(page_no, target, box, text, self.current_color, size)
+
+
+_GL_CLASS = False
+
+
+def _gl_widget_class():
+    """QOpenGLWidget if available (hardware-accelerated drawing), else None."""
+    global _GL_CLASS
+    if _GL_CLASS is False:
+        try:
+            from PySide6.QtOpenGLWidgets import QOpenGLWidget
+            _GL_CLASS = QOpenGLWidget
+        except Exception:
+            _GL_CLASS = None
+    return _GL_CLASS
+
+
+# -- dimension tool (cote) ---------------------------------------------------
+def _dim_methods():
+    """Methods of the "Cote" tool, attached to PdfGraphicsView below.
+
+    1st click = point A, 2nd click (or drag A -> B) = point B, then move the
+    mouse to slide the dimension line away from AB and click to place it.
+    Shift locks AB to 0 / 45 / 90 degrees. Échap or right click cancels."""
+
+    def _visual_at(self, item, viewport_pos, modifiers, anchor=None):
+        scene_pos = self.mapToScene(viewport_pos)
+        if anchor is not None and modifiers & Qt.ShiftModifier:
+            base = item.pos() + anchor
+            d = scene_pos - base
+            ang = math.atan2(d.y(), d.x())
+            snapped = round(ang / (math.pi / 4)) * (math.pi / 4)
+            length = math.hypot(d.x(), d.y()) * math.cos(ang - snapped)
+            scene_pos = base + QPointF(length * math.cos(snapped), length * math.sin(snapped))
+        v = self._scene_to_visual(item, scene_pos)
+        return QPointF(v.x, v.y)
+
+    def _dimension_press(self, event):
+        if event.button() == Qt.RightButton:
+            self._cancel_dimension()
+            event.accept()
+            return
+        if event.button() != Qt.LeftButton:
+            return
+        d = self._dim
+        if d is None:
+            if not self._require_scale():
+                return
+            item = self._item_at_scene(self.mapToScene(event.pos()))
+            if item is None:
+                return
+            a = self._visual_at(item, event.pos(), Qt.NoModifier)
+            preview = ai.DimensionItem(self, item.page_no, None, a, a, 0.0, self.measure_color, " ")
+            preview.setParentItem(item)
+            preview.setZValue(15)
+            self._dim = {"item": item, "a": a, "b": None, "press": event.pos(), "preview": preview}
+            return
+        if d["b"] is None:
+            d["b"] = self._visual_at(d["item"], event.pos(), event.modifiers(), d["a"])
+            self._dimension_b_set()
+            return
+        self._dimension_place()
+
+    def _dimension_release(self, event):
+        d = self._dim
+        if d is None or d["b"] is not None or event.button() != Qt.LeftButton:
+            return
+        # press-drag-release from A to B also works
+        if (event.pos() - d["press"]).manhattanLength() > 8:
+            d["b"] = self._visual_at(d["item"], event.pos(), event.modifiers(), d["a"])
+            self._dimension_b_set()
+
+    def _dimension_b_set(self):
+        d = self._dim
+        if math.hypot(d["b"].x() - d["a"].x(), d["b"].y() - d["a"].y()) < 0.5:
+            d["b"] = None
+            return
+        if self.calibrating:
+            length = math.hypot(d["b"].x() - d["a"].x(), d["b"].y() - d["a"].y())
+            self._cancel_dimension()
+            self._calibrate_with(length)
+            return
+        self.statusMessage.emit("Déplacez la souris pour décaler la cote, puis cliquez pour la poser.")
+
+    def _dimension_move(self, event):
+        d = self._dim
+        pv = d["preview"]
+        pv.prepareGeometryChange()
+        if d["b"] is None:
+            pv.b = self._visual_at(d["item"], event.pos(), event.modifiers(), d["a"])
+            pv.offset = 0.0
+        else:
+            pv.b = d["b"]
+            cur = self._visual_at(d["item"], event.pos(), Qt.NoModifier)
+            n = pv.normal()
+            pv.offset = (cur.x() - d["a"].x()) * n.x() + (cur.y() - d["a"].y()) * n.y()
+        pv.label = pv._compute_label() if pv.a != pv.b else " "
+        pv.update()
+        page = self.doc.page(d["item"].page_no)
+        self._show_measure_info([ai.to_pdf(pv.a, page), ai.to_pdf(pv.b, page)], "line", d["item"])
+
+    def _dimension_place(self):
+        d = self._dim
+        pv = d["preview"]
+        item = d["item"]
+        page = self.doc.page(item.page_no)
+        verts = pv.pdf_vertices(page)
+        label = pv._compute_label()
+        self._cancel_dimension()
+        self.doc.add_dimension(item.page_no, verts, self.measure_color, label)
+        self._rebuild_page_annotations(item)
+        self.documentModified.emit()
+
+    def _cancel_dimension(self):
+        d = getattr(self, "_dim", None)
+        if d is not None and d["preview"].scene() is not None:
+            self._scene.removeItem(d["preview"])
+        self._dim = None
+        if hasattr(self, "_measure_info"):
+            self._measure_info.hide()
+
+    return {k: v for k, v in locals().items() if callable(v)}
+
+
+for _name, _fn in _dim_methods().items():
+    setattr(PdfGraphicsView, _name, _fn)

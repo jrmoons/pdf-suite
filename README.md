@@ -32,6 +32,10 @@ n'est jamais écrasé (nom proposé : `…_modifié.pdf`).
 
 ## Fonctionnalités
 
+- **Ouvrir** : menu, ou **glisser-déposer** un ou plusieurs PDF sur la fenêtre.
+- **Se déplacer** : **clic molette maintenu** + glisser, quel que soit l'outil.
+- **Accélération matérielle** (carte graphique, onglet Affichage, activée par
+  défaut — à décocher en cas de souci d'affichage).
 - **Visionneuse** : multi-onglets, défilement continu, **zoom instantané**
   (Ctrl + molette sous le curseur, boutons, curseur et liste de zoom dans la
   barre d'état, Ctrl+0 / Ctrl+1 / Ctrl+2) même sur de gros plans A0/A1 —
@@ -44,7 +48,13 @@ n'est jamais écrasé (nom proposé : `…_modifié.pdf`).
   Les formes, flèches, nuages, légendes et tampons sont des objets vectoriels
   déplaçables (clic droit → Verrouiller / Supprimer).
 - **Mesures (plans)** :
-  - Longueur, Périmètre, **Surface (m²)** ;
+  - **Cote** (outil principal) : clic sur A, clic sur B (ou glisser de A à B,
+    Maj = 0° / 45° / 90°), puis déplacer la souris pour **décaler la cote**
+    et cliquer pour la poser — lignes de rappel, traits obliques, longueur
+    écrite le long de la ligne. Une cote posée se **fait coulisser** à la
+    souris (décalage), ses points A / B se déplacent par leurs poignées,
+    clic droit → Changer de côté / Verrouiller / Supprimer ;
+  - Périmètre, **Surface (m²)** ;
   - **Barre « Mesure »** sous le ruban (visible avec un outil de mesure ou
     l'onglet Mesures) : échelle « 1 cm sur le plan = 0,5 m en réel »,
     préréglages 1:50, 1:100…, unité des longueurs (mm / cm / m), précision,
@@ -66,7 +76,8 @@ n'est jamais écrasé (nom proposé : `…_modifié.pdf`).
   (page sombre), **vue fractionnée** (deux vues du même document).
 - **Pages** : insérer une page vierge, supprimer, pivoter, réordonner,
   insérer un PDF, extraire, diviser.
-- **Édition de texte** bloc par bloc, **formulaires** AcroForm,
+- **Édition de texte** bloc par bloc (garde position, taille, couleur et sens
+  du texte d'origine, y compris les petits textes et textes verticaux des plans), **formulaires** AcroForm,
   **signature** dessinée.
 - **Protéger** : mot de passe AES-256 ; ouverture de PDF protégés.
 

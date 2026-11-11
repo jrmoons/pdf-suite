@@ -50,6 +50,37 @@ class PdfDocument:
 
     def _invalidate_pages(self):
         self._page_cache = {}
+        self._dl_cache = {}
+
+    def invalidate_render(self, index: int | None = None):
+        """Forget the cached drawing of a page whose content changed."""
+        if not hasattr(self, "_dl_cache"):
+            self._dl_cache = {}
+        if index is None:
+            self._dl_cache = {}
+        else:
+            self._dl_cache.pop(index, None)
+
+    def display_list(self, index: int):
+        """Parsed drawing of a page (content only, no annotations), cached:
+        rendering a zoomed area from it is ~10x faster than from the page."""
+        if not hasattr(self, "_dl_cache"):
+            self._dl_cache = {}
+        dl = self._dl_cache.get(index)
+        if dl is None:
+            dl = self.page(index).get_displaylist(annots=False)
+            self._dl_cache[index] = dl
+        return dl
+
+    def render_clip(self, index: int, zoom: float, clip=None) -> pymupdf.Pixmap:
+        """Render (part of) a page's content at ``zoom`` (visual coords)."""
+        page = self.page(index)
+        mat = pymupdf.Matrix(zoom, zoom)
+        if page.rotation:
+            # display lists ignore /Rotate: fall back to the page itself
+            return page.get_pixmap(matrix=pymupdf.Matrix(zoom, zoom), clip=clip,
+                                   alpha=False, annots=False)
+        return self.display_list(index).get_pixmap(matrix=mat, clip=clip, alpha=False)
 
     # -- measurement scale ----------------------------------------------
     def _read_scale(self) -> float | None:
@@ -172,6 +203,9 @@ class PdfDocument:
     def measure_label(self, subject: str, pts) -> str:
         """Label of a measurement from its vertices [(x, y), ...]."""
         pts = [(float(p[0]), float(p[1])) for p in pts]
+        if subject.endswith("dimension"):
+            import math
+            return self.fmt_length_pts(math.dist(pts[0], pts[-1]))
         if subject.endswith("line"):
             return self.fmt_length_pts(self.poly_perimeter(pts, closed=False))
         area = self.fmt_area_pts2(self.poly_area(pts))
@@ -249,9 +283,7 @@ class PdfDocument:
         # the Qt scene, so the raster only needs the page's own content.
         # This also means adding/moving an annotation never requires
         # re-rasterising the page (the previous source of the UI lag).
-        page = self.page(index)
-        mat = pymupdf.Matrix(zoom, zoom)
-        return page.get_pixmap(matrix=mat, alpha=False, annots=False)
+        return self.render_clip(index, zoom)
 
     def thumbnail(self, index: int, max_dim: int = 140) -> pymupdf.Pixmap:
         page = self.page(index)
@@ -298,6 +330,7 @@ class PdfDocument:
     def rotate_page(self, index: int, degrees: int):
         page = self.page(index)
         page.set_rotation((page.rotation + degrees) % 360)
+        self.invalidate_render(index)
         self.mark_dirty()
 
     def move_page(self, src: int, dst: int):
@@ -461,6 +494,21 @@ class PdfDocument:
         self.mark_dirty()
         return annot
 
+    def add_dimension(self, index: int, vertices, color, label: str):
+        """Aligned dimension stored as a polyline A, A', B', B (so any PDF
+        reader shows the extension and dimension lines)."""
+        annot = self.page(index).add_polyline_annot([pymupdf.Point(v) for v in vertices])
+        annot.set_colors(stroke=color)
+        annot.set_border(width=0.8)
+        annot.set_info(subject="pdfsuite:measure_dimension", content=label)
+        annot.update()
+        self.mark_dirty()
+        return annot
+
+    def update_dimension(self, index: int, old_annot, vertices, color, label: str):
+        self.delete_annot(index, old_annot)
+        return self.add_dimension(index, vertices, color, label)
+
     def update_measure_line(self, index: int, old_annot, p1, p2, color, label: str):
         self.delete_annot(index, old_annot)
         return self.add_measure_line(index, p1, p2, color, label)
@@ -580,7 +628,11 @@ class PdfDocument:
                 if len(pts) < 2:
                     continue
                 kind = subject.split("_", 1)[1]
-                if kind == "line":
+                if kind == "dimension":
+                    import math
+                    length, area = math.dist(pts[0], pts[-1]), None
+                    kind = "line"
+                elif kind == "line":
                     length, area = self.poly_perimeter(pts, closed=False), None
                 else:
                     length, area = self.poly_perimeter(pts), self.poly_area(pts)
@@ -618,10 +670,6 @@ class PdfDocument:
         return len(rows)
 
     # -- capture --------------------------------------------------------
-    def render_clip(self, index: int, rect, dpi: int = 200) -> pymupdf.Pixmap:
-        """High-resolution render of part of a page, annotations included."""
-        return self.page(index).get_pixmap(dpi=dpi, clip=pymupdf.Rect(rect), annots=True)
-
     def delete_annot_at(self, index: int, point) -> bool:
         page = self.page(index)
         for annot in page.annots() or []:
@@ -645,29 +693,35 @@ class PdfDocument:
         return self.page(index).get_text("dict")["blocks"]
 
     def replace_text_in_rect(self, index: int, rect, new_text: str,
-                              fontsize: float, color=(0, 0, 0), fontname="helv"):
+                             fontsize: float, color=(0, 0, 0), fontname="helv",
+                             origin=None, direction=(1.0, 0.0)):
+        """Replace a text block: the old text is removed (redaction) and the
+        new one written at the same baseline, size, colour and direction.
+        (Earlier versions skipped any text smaller than 6 pt - typical of
+        plans - so the edited text simply vanished.)"""
+        import math
         page = self.page(index)
-        page.add_redact_annot(rect, fill=(1, 1, 1))
-        page.apply_redactions(images=pymupdf.PDF_REDACT_IMAGE_NONE)
-
-        # Let the box grow to the right/below (bounded by the page) so the
-        # replacement text has room, then shrink the font if it still
-        # doesn't fit rather than silently dropping characters.
-        page_rect = page.rect
-        box = pymupdf.Rect(
-            rect.x0, rect.y0,
-            max(rect.x1, page_rect.x1 - 18),
-            max(rect.y1, page_rect.y1 - 18),
-        )
-        size = fontsize
-        while size >= 6:
-            rc = page.insert_textbox(
-                box, new_text, fontsize=size, fontname=fontname,
-                color=color, align=0,
-            )
-            if rc >= 0:
-                break
-            size -= 1
+        page.add_redact_annot(rect, fill=False)
+        page.apply_redactions(images=pymupdf.PDF_REDACT_IMAGE_NONE,
+                              graphics=pymupdf.PDF_REDACT_LINE_ART_NONE)
+        lines = new_text.split("\n")
+        dx, dy = direction
+        angle = math.degrees(math.atan2(-dy, dx))
+        rot = round(angle / 90) * 90 % 360 if abs(angle / 90 - round(angle / 90)) < 0.02 else None
+        if origin is None:
+            origin = pymupdf.Point(rect.x0, rect.y0 + fontsize)
+        origin = pymupdf.Point(origin)
+        step = fontsize * 1.2
+        for i, line in enumerate(lines):
+            # next line = one step "below", perpendicular to the text direction
+            pt = pymupdf.Point(origin.x - dy * step * i, origin.y + dx * step * i)
+            if rot is not None:
+                page.insert_text(pt, line, fontsize=fontsize, fontname=fontname,
+                                 color=color, rotate=rot)
+            else:
+                page.insert_text(pt, line, fontsize=fontsize, fontname=fontname, color=color,
+                                 morph=(pt, pymupdf.Matrix(-angle)))
+        self.invalidate_render(index)
         self.mark_dirty()
 
     # -- security ---------------------------------------------------------

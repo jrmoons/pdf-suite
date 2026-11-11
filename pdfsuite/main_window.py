@@ -72,6 +72,7 @@ class MainWindow(QMainWindow):
         super().__init__()
         self.setWindowTitle("PDF Suite")
         self.resize(1280, 860)
+        self.setAcceptDrops(True)
 
         self.tabs = QTabWidget()
         self.tabs.setTabsClosable(True)
@@ -150,6 +151,8 @@ class MainWindow(QMainWindow):
         Tool.ERASER: ("Gomme", "eraser", False, None),
         Tool.TEXTEDIT: ("Modifier texte", "textedit", False, None),
         Tool.SIGNATURE: ("Signature", "signature", False, None),
+        Tool.DIMENSION: ("Cote", "dimension", False,
+                         "Clic A, clic B, puis déplacez pour décaler la cote et cliquez (Maj = angle droit)"),
         Tool.MEASURE_LINE: ("Longueur", "measure_line", False, "Mesurer une ligne"),
         Tool.MEASURE_PERIMETER: ("Périmètre", "measure_perimeter", False,
                                  "Clic à chaque coin, clic droit ou Entrée pour terminer"),
@@ -224,6 +227,11 @@ class MainWindow(QMainWindow):
         self.act_rulers = self._act("Règles", self.toggle_rulers, checkable=True,
                                     tip="Règles graduées (unités réelles si l'échelle est connue)")
         self.act_rulers.setChecked(bool(self.settings.value("rulers", True, type=bool)))
+        self.act_gpu = self._act("Accélération matérielle", self.toggle_gpu, checkable=True,
+                                 needs_doc=False,
+                                 tip="Affichage par la carte graphique (plus fluide). "
+                                     "À décocher en cas de souci d'affichage.")
+        self.act_gpu.setChecked(bool(self.settings.value("gpu", True, type=bool)))
         self.act_loupe = self._act("Loupe", self.toggle_loupe, "loupe", checkable=True,
                                    tip="Loupe qui suit la souris")
         self.act_invert = self._act("Inverser couleurs", self.toggle_invert, "invert",
@@ -264,7 +272,7 @@ class MainWindow(QMainWindow):
         home.addAction(t[Tool.SIGNATURE])
         home.addAction(self.act_new_signature)
         home.addSeparator()
-        home.addAction(t[Tool.MEASURE_LINE])
+        home.addAction(t[Tool.DIMENSION])
         home.addAction(t[Tool.CAPTURE])
         home.addSeparator()
         home.addAction(self.act_toggle_theme)
@@ -292,7 +300,7 @@ class MainWindow(QMainWindow):
         measures = self.ribbon.add_page("Mesures")
         measures.addAction(t[Tool.SELECT])
         measures.addSeparator()
-        for tool in (Tool.MEASURE_LINE, Tool.MEASURE_PERIMETER, Tool.MEASURE_AREA):
+        for tool in (Tool.DIMENSION, Tool.MEASURE_PERIMETER, Tool.MEASURE_AREA):
             measures.addAction(t[tool])
         measures.addAction(self.act_scale)
         measures.addSeparator()
@@ -320,7 +328,7 @@ class MainWindow(QMainWindow):
             view.addAction(a)
         view.addSeparator()
         for a in (self.act_rulers, self.act_loupe, self.act_invert, self.act_split_view,
-                  self.act_grid):
+                  self.act_grid, self.act_gpu):
             view.addAction(a)
         view.addSeparator()
         view.addAction(self.act_toggle_theme)
@@ -518,6 +526,8 @@ class MainWindow(QMainWindow):
         view.requestSelectTool.connect(lambda: self._activate_tool(Tool.SELECT))
         view.set_measure_color(self.measure_bar.color)
         view.set_rulers(self.act_rulers.isChecked())
+        view.set_gpu(self.act_gpu.isChecked())
+        view.filesDropped.connect(self.open_files)
         view.scaleRequired.connect(self._on_scale_required)
         view.scaleCalibrated.connect(lambda t=tab: self._on_measure_settings())
 
@@ -572,6 +582,31 @@ class MainWindow(QMainWindow):
         if tab is not None:
             tab.view.fit_page()
 
+    def toggle_gpu(self, checked: bool):
+        self.settings.setValue("gpu", checked)
+        for i in range(self.tabs.count()):
+            for v in self.tabs.widget(i).views():
+                v.set_gpu(checked)
+
+    # -- drag & drop of PDF files anywhere on the window ---------------
+    def open_files(self, paths):
+        for path in paths:
+            self.open_file(path)
+
+    def dragEnterEvent(self, event):
+        if PdfGraphicsView._pdf_paths(event.mimeData()):
+            event.acceptProposedAction()
+
+    def dragMoveEvent(self, event):
+        if PdfGraphicsView._pdf_paths(event.mimeData()):
+            event.acceptProposedAction()
+
+    def dropEvent(self, event):
+        paths = PdfGraphicsView._pdf_paths(event.mimeData())
+        if paths:
+            event.acceptProposedAction()
+            self.open_files(paths)
+
     def toggle_rulers(self, checked: bool):
         self.settings.setValue("rulers", checked)
         for i in range(self.tabs.count()):
@@ -614,7 +649,7 @@ class MainWindow(QMainWindow):
         tab = self.current_tab()
         if tab is None:
             return
-        self._activate_tool(Tool.MEASURE_LINE)
+        self._activate_tool(Tool.DIMENSION)
         for v in tab.views():
             v.start_calibration()
 

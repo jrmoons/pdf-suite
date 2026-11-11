@@ -24,6 +24,7 @@ class Tool(Enum):
     CALLOUT = auto()
     STAMP = auto()
     CAPTURE = auto()
+    DIMENSION = auto()      # cote : A, B, puis décalage
 
 
 DRAG_TOOLS = {Tool.HIGHLIGHT, Tool.UNDERLINE, Tool.STRIKEOUT, Tool.RECT,

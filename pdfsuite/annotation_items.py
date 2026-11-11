@@ -617,6 +617,263 @@ class MeasurePolygonItem(MeasureItemBase):
         self.view.documentModified.emit()
 
 
+class DimensionItem(QGraphicsObject):
+    """Aligned dimension ("cote"): measured points A and B, extension lines,
+    a dimension line offset from AB, oblique ticks and the length written
+    along the line. Drag the dimension line to slide it (change the
+    offset); drag the A / B handles to move the measured points."""
+
+    subject = "pdfsuite:measure_dimension"
+    LABEL_PX = 12
+    GAP_PX = 3          # gap between measured point and extension line
+    OVER_PX = 6         # extension line overshoot past the dimension line
+    TICK_PX = 6
+
+    def __init__(self, view, page_no, annot, a: QPointF, b: QPointF, offset: float,
+                 color, label: str = ""):
+        super().__init__()
+        self.view = view
+        self.page_no = page_no
+        self.annot = annot
+        self.a = QPointF(a)
+        self.b = QPointF(b)
+        self.offset = offset
+        self.color_tuple = tuple(color)
+        self.color = _qcolor(color)
+        self.label = label or self._compute_label()
+        self.locked = False
+        self.handles: list[VertexHandle] = []
+        self._press = None
+        self.setZValue(9)
+        self.setFlag(QGraphicsItem.ItemIsSelectable, True)
+        self.setCursor(Qt.SizeVerCursor)
+        self.setAcceptHoverEvents(True)
+
+    # -- geometry ---------------------------------------------------------
+    def _k(self) -> float:
+        return 1.0 / max(self.view.zoom, 1e-6)
+
+    def normal(self) -> QPointF:
+        dx, dy = self.b.x() - self.a.x(), self.b.y() - self.a.y()
+        length = math.hypot(dx, dy) or 1.0
+        return QPointF(dy / length, -dx / length)
+
+    def dim_points(self) -> tuple[QPointF, QPointF]:
+        n = self.normal()
+        return self.a + n * self.offset, self.b + n * self.offset
+
+    def pdf_vertices(self, page):
+        a2, b2 = self.dim_points()
+        return [to_pdf(p, page) for p in (self.a, a2, b2, self.b)]
+
+    def _compute_label(self) -> str:
+        return self.view.doc.measure_label(self.subject, [(self.a.x(), self.a.y()),
+                                                          (self.b.x(), self.b.y())])
+
+    def _font(self) -> QFont:
+        f = QFont()
+        f.setPixelSize(self.LABEL_PX)
+        f.setBold(True)
+        return f
+
+    def _text_geometry(self):
+        """Centre, angle (degrees, kept readable) and size of the text."""
+        a2, b2 = self.dim_points()
+        ang = math.degrees(math.atan2(b2.y() - a2.y(), b2.x() - a2.x()))
+        if ang > 90:
+            ang -= 180
+        elif ang <= -90:
+            ang += 180
+        fm = QFontMetricsF(self._font())
+        k = self._k()
+        w = (fm.horizontalAdvance(self.label) + 8) * k
+        h = (fm.height() + 2) * k
+        mid = QPointF((a2.x() + b2.x()) / 2, (a2.y() + b2.y()) / 2)
+        # text sits on the outer side of the dimension line
+        n = self.normal()
+        side = 1.0 if self.offset >= 0 else -1.0
+        r = math.radians(ang)
+        up = QPointF(math.sin(r), -math.cos(r))          # "above" the text line
+        if up.x() * n.x() * side + up.y() * n.y() * side < 0:
+            up = QPointF(-up.x(), -up.y())
+        centre = mid + up * (h / 2 + 1 * k)
+        return centre, ang, w, h
+
+    def boundingRect(self) -> QRectF:
+        a2, b2 = self.dim_points()
+        k = self._k()
+        pad = (self.OVER_PX + self.TICK_PX) * k
+        r = QRectF(self.a, self.b).normalized().united(QRectF(a2, b2).normalized())
+        r = r.adjusted(-pad, -pad, pad, pad)
+        c, _ang, w, h = self._text_geometry()
+        m = max(w, h) / 2 + 2 * k
+        return r.united(QRectF(c.x() - m, c.y() - m, 2 * m, 2 * m))
+
+    def shape(self):
+        """Clickable area: the dimension line and the text (not the whole
+        box), so the plan underneath stays easy to click."""
+        a2, b2 = self.dim_points()
+        k = self._k()
+        path = QPainterPath()
+        n = self.normal()
+        t = 5 * k
+        poly = [a2 + n * t, b2 + n * t, b2 - n * t, a2 - n * t]
+        path.moveTo(poly[0])
+        for p in poly[1:]:
+            path.lineTo(p)
+        path.closeSubpath()
+        c, ang, w, h = self._text_geometry()
+        tp = QPainterPath()
+        tp.addRect(QRectF(-w / 2, -h / 2, w, h))
+        from PySide6.QtGui import QTransform
+        tr = QTransform()
+        tr.translate(c.x(), c.y())
+        tr.rotate(ang)
+        return path.united(tr.map(tp))
+
+    def paint(self, painter, option, widget=None):
+        k = self._k()
+        pen = QPen(self.color, 1.4 if not self.isSelected() else 2.2)
+        pen.setCosmetic(True)
+        painter.setPen(pen)
+        painter.setBrush(Qt.NoBrush)
+        n = self.normal()
+        side = 1.0 if self.offset >= 0 else -1.0
+        a2, b2 = self.dim_points()
+        gap, over = self.GAP_PX * k, self.OVER_PX * k
+        if abs(self.offset) > gap:
+            for p, p2 in ((self.a, a2), (self.b, b2)):
+                painter.drawLine(p + n * (gap * side), p2 + n * (over * side))
+        painter.drawLine(a2, b2)
+        # oblique architectural ticks (45°)
+        d = b2 - a2
+        length = math.hypot(d.x(), d.y()) or 1.0
+        u = QPointF(d.x() / length, d.y() / length)
+        t = self.TICK_PX * k
+        diag = QPointF((u.x() + n.x()) * t / 1.414, (u.y() + n.y()) * t / 1.414)
+        for p in (a2, b2):
+            painter.drawLine(p - diag, p + diag)
+        # text along the line
+        c, ang, w, h = self._text_geometry()
+        painter.save()
+        painter.translate(c)
+        painter.rotate(ang)
+        painter.scale(k, k)
+        painter.setPen(Qt.NoPen)
+        painter.setBrush(QBrush(QColor(255, 255, 255, 215)))
+        painter.drawRoundedRect(QRectF(-w / 2 / k, -h / 2 / k, w / k, h / k), 2, 2)
+        painter.setFont(self._font())
+        painter.setPen(QPen(self.color))
+        painter.drawText(QRectF(-w / 2 / k, -h / 2 / k, w / k, h / k), Qt.AlignCenter, self.label)
+        painter.restore()
+
+    def zoom_changed(self):
+        self.prepareGeometryChange()
+        self.update()
+
+    # -- sliding the dimension line ---------------------------------------
+    def mousePressEvent(self, event):
+        if event.button() == Qt.LeftButton and not self.locked:
+            self._press = (event.scenePos(), self.offset)
+            self.setSelected(True)
+            event.accept()
+            return
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event):
+        if self._press is None:
+            return super().mouseMoveEvent(event)
+        start, off0 = self._press
+        d = event.scenePos() - start
+        n = self.normal()
+        self.prepareGeometryChange()
+        self.offset = off0 + d.x() * n.x() + d.y() * n.y()
+        self.update()
+        event.accept()
+
+    def mouseReleaseEvent(self, event):
+        if self._press is not None:
+            _start, off0 = self._press
+            self._press = None
+            if abs(self.offset - off0) > 1e-3:
+                self._sync_to_pdf()
+            event.accept()
+            return
+        super().mouseReleaseEvent(event)
+
+    # -- A / B handles (VertexHandle protocol) ------------------------------
+    def make_handles(self, page_item):
+        self.handles = []
+        for i, pt in enumerate((self.a, self.b)):
+            h = VertexHandle(self, i, parent=page_item)
+            h.setPos(pt)
+            self.handles.append(h)
+        return self.handles
+
+    def handle_moving(self, index: int, new_pos: QPointF):
+        self.prepareGeometryChange()
+        if index == 0:
+            self.a = QPointF(new_pos)
+        else:
+            self.b = QPointF(new_pos)
+        self.label = self._compute_label()
+        self.update()
+
+    def handle_released(self):
+        self._sync_to_pdf()
+
+    def set_locked(self, locked: bool):
+        self.locked = locked
+        for h in self.handles:
+            h.set_locked(locked)
+        self.setCursor(Qt.ArrowCursor if locked else Qt.SizeVerCursor)
+
+    def contextMenuEvent(self, event):
+        menu = QMenu()
+        act_flip = menu.addAction("Changer de côté")
+        act_lock = menu.addAction("Déverrouiller" if self.locked else "Verrouiller")
+        menu.addSeparator()
+        act_del = menu.addAction("Supprimer")
+        chosen = menu.exec(event.screenPos())
+        if chosen is act_flip:
+            self.prepareGeometryChange()
+            self.offset = -self.offset
+            self._sync_to_pdf()
+        elif chosen is act_lock:
+            self.set_locked(not self.locked)
+        elif chosen is act_del:
+            if self.annot is not None:
+                self.view.doc.delete_annot(self.page_no, self.annot)
+            self.view.remove_annotation_item(self.page_no, self)
+            for h in self.handles:
+                if h.scene():
+                    h.scene().removeItem(h)
+            self.view.documentModified.emit()
+        event.accept()
+
+    def _sync_to_pdf(self):
+        if self.annot is None:
+            return
+        page = self.view.doc.page(self.page_no)
+        self.label = self._compute_label()
+        self.annot = self.view.doc.update_dimension(
+            self.page_no, self.annot, self.pdf_vertices(page), self.color_tuple, self.label)
+        self.update()
+        self.view.documentModified.emit()
+
+
+def dimension_from_vertices(view, page, page_no, annot, verts, color, label=""):
+    """Rebuild a DimensionItem from its stored PDF vertices [A, A', B', B]."""
+    a = to_visual(verts[0], page)
+    a2 = to_visual(verts[1], page)
+    b = to_visual(verts[-1], page)
+    item = DimensionItem(view, page_no, annot, a, b, 0.0, color, label)
+    n = item.normal()
+    item.offset = (a2.x() - a.x()) * n.x() + (a2.y() - a.y()) * n.y()
+    item.label = item._compute_label()
+    return item
+
+
 def _polygon_perimeter(points: list[QPointF]) -> float:
     total = 0.0
     n = len(points)
@@ -866,6 +1123,12 @@ def build_item_for_annot(view, page, page_no: int, annot):
             return []
         return [ShapeItem(view, page_no, annot, "ink", strokes, color, None,
                            annot.border.get("width") or 2.0)]
+
+    if kind == "PolyLine" and subject == "pdfsuite:measure_dimension":
+        verts = annot.vertices or []
+        if len(verts) < 4:
+            return []
+        return [dimension_from_vertices(view, page, page_no, annot, verts, color)]
 
     if kind == "Polygon" and subject in ("pdfsuite:measure_perimeter", "pdfsuite:measure_area"):
         verts = annot.vertices or []

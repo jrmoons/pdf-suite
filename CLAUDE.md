@@ -19,6 +19,15 @@
 - Mesures : tout libellé passe par `PdfDocument.measure_label` (unité `PDFSuiteUnit`,
   précision `PDFSuiteDecimals`, échelle `PDFSuiteScale`, surfaces toujours en m²).
   Barre de propriétés = `measure_bar.py`. Pas de mesure sans échelle (`scaleRequired`).
+- Rendu : `PdfDocument.display_list()` (cache, ~10x plus rapide pour les zones zoomées),
+  invalider avec `invalidate_render(i)` à chaque changement de CONTENU de page.
+  GPU : `PdfGraphicsView.set_gpu` (QOpenGLWidget) ; `viewport().grab()` rend BLANC avec le
+  GPU → utiliser `QGraphicsView.render()` (loupe) ; vérifier visuellement via
+  `QScreen.grabWindow`. Changer de viewport détruit ses widgets enfants (MeasureInfo recréé).
+- Cote = `DimensionItem` (annotation_items), stockée en PolyLine A, A', B', B,
+  subject `pdfsuite:measure_dimension`.
+- Texte modifié : `replace_text_in_rect` réécrit à l'origine/couleur/direction du span
+  (ancien bug : rien n'était réécrit sous 6 pt).
 - Tests : chaque `.smoke/run_smoke*.py` utilise des réglages séparés
   (`PDFSUITE_SETTINGS=PDFSuiteTests`, `settings.py`) — ne jamais écrire dans les réglages
   réels de Jérémy.

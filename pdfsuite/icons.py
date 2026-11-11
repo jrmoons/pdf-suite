@@ -470,7 +470,21 @@ def _draw_capture(p: QPainter, r: QRectF, c: QColor):
     p.drawLine(QPointF(r.center().x() - 4, r.center().y()), QPointF(r.center().x() + 4, r.center().y()))
 
 
+def _draw_dimension(p: QPainter, r: QRectF, c: QColor):
+    y = r.top() + 10
+    p.drawLine(QPointF(r.left() + 5, r.bottom() - 5), QPointF(r.left() + 5, y - 3))
+    p.drawLine(QPointF(r.right() - 5, r.bottom() - 5), QPointF(r.right() - 5, y - 3))
+    p.drawLine(QPointF(r.left() + 5, y), QPointF(r.right() - 5, y))
+    for x in (r.left() + 5, r.right() - 5):
+        p.drawLine(QPointF(x - 3, y + 3), QPointF(x + 3, y - 3))
+    f = QFont()
+    f.setPixelSize(8)
+    p.setFont(f)
+    p.drawText(QRectF(r.left(), y + 2, r.width(), 10), Qt.AlignCenter, "3,25")
+
+
 _DRAWERS.update({
+    "dimension": _draw_dimension,
     "arrow": _draw_arrow,
     "cloud": _draw_cloud,
     "callout": _draw_callout,
