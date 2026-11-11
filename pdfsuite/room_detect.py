@@ -595,6 +595,9 @@ def _build(data: dict):
             v = grey_c[k] = _light_grey(c)
         return v
 
+    # floor patterns (tiling grid) are not walls; stairs are a limit
+    pattern_keys, stair_polys = _patterns(data["drawings"], T, scale)
+
     # furniture / fittings: small blocks filled light grey (wardrobe, WC frame,
     # appliance), on any layer. Their outline and cross may be drawn apart on
     # the wall layer: lines lying inside such a block are not walls.
@@ -694,6 +697,9 @@ def _build(data: dict):
             op = it[0]
             if op == "l":
                 a, b = T(it[1]), T(it[2])
+                if pattern_keys and _seg_key(a, b) in pattern_keys:
+                    last = None
+                    continue                 # tiling grid of a floor
                 if not filled and in_furniture(a, b):
                     last = None
                     continue                 # outline / cross of a fitting
@@ -747,6 +753,21 @@ def _build(data: dict):
     arr = np.frombuffer(img.constBits(), np.uint8,
                         count=img.bytesPerLine() * H).reshape(H, img.bytesPerLine())[:, :W]
     mask = arr < 128
+    if stair_polys:
+        # a staircase stops the room like a wall
+        img3 = QImage(W, H, QImage.Format_Grayscale8)
+        img3.fill(255)
+        qp = QPainter(img3)
+        qp.setRenderHint(QPainter.Antialiasing, False)
+        qp.scale(zoom, zoom)
+        qp.setPen(Qt.NoPen)
+        qp.setBrush(QBrush(QColor(0, 0, 0)))
+        for poly in stair_polys:
+            qp.drawPolygon(QPolygonF([QPointF(x, y) for x, y in poly]))
+        qp.end()
+        a3 = np.frombuffer(img3.constBits(), np.uint8,
+                           count=img3.bytesPerLine() * H).reshape(H, img3.bytesPerLine())[:, :W]
+        mask |= a3 < 128
     segs = np.array(segs, float).reshape(-1, 4)
     if len(segs):
         segs = segs[np.hypot(segs[:, 2] - segs[:, 0], segs[:, 3] - segs[:, 1]) >= min_len]
@@ -805,6 +826,196 @@ def _build(data: dict):
     prep.runs = {}
     _runs(prep)                        # flood tables ready before the first click
     return prep
+
+
+def _seg_key(a, b):
+    k1 = (round(a[0], 1), round(a[1], 1), round(b[0], 1), round(b[1], 1))
+    k2 = k1[2:] + k1[:2]
+    return min(k1, k2)
+
+
+def _runs_equal(rhos, spacing_min, spacing_max, min_count):
+    """Chains of lines at a constant spacing among sorted offsets ``rhos``
+    (duplicates and unrelated lines in between are tolerated), the longest
+    chains first. Returns [(first index, last index, spacing, members)]."""
+    import bisect
+    r = list(rhos)
+    n = len(r)
+    cands = []
+    for i in range(n):
+        if i and abs(r[i] - r[i - 1]) < 1e-6:
+            continue
+        for j in range(i + 1, n):
+            d = r[j] - r[i]
+            if d < spacing_min:
+                continue
+            if d > spacing_max:
+                break
+            tol = max(0.02 * d, 0.002 * spacing_max)
+            chain = [i, j]
+            while True:
+                want = r[chain[-1]] + d
+                k = bisect.bisect_left(r, want - tol)
+                if k < n and abs(r[k] - want) <= tol:
+                    chain.append(k)
+                else:
+                    break
+            if len(chain) >= min_count:
+                cands.append((len(chain), chain, d))
+    cands.sort(key=lambda c: -c[0])
+    out, taken = [], set()
+    for _, chain, d in cands:
+        if taken.intersection(chain):
+            continue
+        out.append((chain[0], chain[-1], d, chain))
+        taken.update(chain)
+    return out
+
+
+def _patterns(drawings, T, scale):
+    """Regular families of parallel lines, from any layer:
+    - two crossing families at a constant spacing (0.2-1.2 m) = a tiling
+      grid of a floor: those lines are never walls;
+    - one family of >= 6 equal lines every 20-35 cm with no crossing family
+      = the treads of a staircase: its outline becomes a limit."""
+    L = []
+    for d in drawings:
+        if "s" not in d.get("type", ""):
+            continue
+        for it in d.get("items", ()):
+            if it[0] == "l":
+                pairs = [(T(it[1]), T(it[2]))]
+            elif it[0] == "re":
+                r_ = it[1]
+                c = [T((r_[0], r_[1])), T((r_[2], r_[1])), T((r_[2], r_[3])), T((r_[0], r_[3]))]
+                pairs = [(c[k], c[(k + 1) % 4]) for k in range(4)]
+            else:
+                continue
+            for a, b in pairs:
+                if math.dist(a, b) > 0.15 * scale:
+                    L.append((a[0], a[1], b[0], b[1]))
+    if len(L) < 6:
+        return set(), []
+    A = np.array(L, float)
+    th = np.degrees(np.arctan2(A[:, 3] - A[:, 1], A[:, 2] - A[:, 0])) % 180
+    th = np.round(th * 2) / 2 % 180
+    keys, stairs = set(), []
+    # main directions of the building = directions of the long lines (walls);
+    # hatching runs across them, a tiling follows them
+    lens = np.hypot(A[:, 2] - A[:, 0], A[:, 3] - A[:, 1])
+    longl = lens >= 1.0 * scale
+    main = set()
+    if longl.any():
+        tot = lens[longl].sum()
+        for ang in np.unique(th[longl]):
+            if lens[longl][th[longl] == ang].sum() >= 0.08 * tot:
+                main.add(float(ang))
+    fams = {}
+    for ang in np.unique(th):
+        idx = np.nonzero(th == ang)[0]
+        if len(idx) < 4:
+            continue
+        r = math.radians(ang)
+        ux, uy = math.cos(r), math.sin(r)
+        rho = -uy * A[idx, 0] + ux * A[idx, 1]
+        t0 = ux * A[idx, 0] + uy * A[idx, 1]
+        t1 = ux * A[idx, 2] + uy * A[idx, 3]
+        lo, hi = np.minimum(t0, t1), np.maximum(t0, t1)
+        fams[ang] = (idx, rho, lo, hi, ux, uy)
+    used = set()
+    for ang, (idx, rho, lo, hi, ux, uy) in fams.items():
+        # cluster lines that overlap along their direction, then look for runs
+        o = np.argsort(lo)
+        groups, cur, cur_hi = [], [], -1e18
+        for k in o:
+            if cur and lo[k] > cur_hi:
+                groups.append(cur)
+                cur, cur_hi = [], -1e18
+            cur.append(k)
+            cur_hi = max(cur_hi, hi[k])
+        if cur:
+            groups.append(cur)
+        for g in groups:
+            g = np.array(g)
+            g = g[np.argsort(rho[g])]
+            rr = rho[g]
+            # merge duplicates (same line drawn twice)
+            for i, j, dsp, members in _runs_equal(rr, 0.2 * scale, 1.2 * scale, 5):
+                sel = g[members]
+                med = np.median(hi[sel] - lo[sel])
+                best = []
+                for mrho in rr[members]:
+                    cand = g[np.abs(rr - mrho) < 1e-6]
+                    best.append(cand[np.argmin(np.abs((hi[cand] - lo[cand]) - med))])
+                sel = np.array(best)
+                # every piece lying on one of these lines (a grid line is often
+                # cut into one piece per tile)
+                on = np.isin(np.round(rr, 1), np.round(rr[members], 1))
+                sel_all = g[on]
+                length = hi[sel] - lo[sel]
+                cross = fams.get((ang + 90) % 180)
+                crossing = False
+                if cross is not None:
+                    cidx, crho, clo, chi = cross[:4]
+                    # a crossing family inside the same box, at a regular spacing too
+                    box_lo, box_hi = rr[i], rr[j]
+                    # crossing lines: their offset is minus the position along
+                    # this family's direction, their extent is along its offsets
+                    cpos = -crho
+                    inside = (clo <= box_hi + 1e-6) & (chi >= box_lo - 1e-6) &                              (cpos >= lo[g].min() - 1e-6) & (cpos <= hi[g].max() + 1e-6)
+                    crr = np.sort(cpos[inside])
+                    cruns = _runs_equal(crr, 0.2 * scale, 1.2 * scale, 5)
+                    crossing = False
+                    tol_n = 0.02 * scale
+                    ra = rr[members]
+                    for _ci, _cj, _cd, cmem in cruns:
+                        rb = crr[cmem]
+                        # a real tiling: at (nearly) every node both lines exist
+                        ok = tot = 0
+                        for a_ in ra:
+                            onA = np.abs(rho - a_) <= tol_n
+                            for b_ in rb:
+                                tot += 1
+                                hasA = bool(np.any(onA & (lo <= b_ + tol_n) & (hi >= b_ - tol_n)))
+                                onB = np.abs(cpos - b_) <= tol_n
+                                hasB = bool(np.any(onB & (clo <= a_ + tol_n) & (chi >= a_ - tol_n)))
+                                ok += hasA and hasB
+                        if tot and ok >= 0.7 * tot:
+                            crossing = True
+                            t_lo, t_hi = float(rb.min()), float(rb.max())
+                            box_lo, box_hi = float(ra.min()), float(ra.max())
+                            break
+                if crossing and (float(ang) not in main or float((ang + 90) % 180) not in main):
+                    crossing = False             # hatching, not a tiling
+                    continue
+                if crossing:
+                    # only the pieces entirely inside the tiled rectangle (a
+                    # wall line always runs beyond it)
+                    eps = 0.02 * scale
+                    near_lo, near_hi = 0.02 * scale, 0.15 * scale
+
+                    def twin(off, a0, a1, offs, los, his):
+                        # a wall / low wall: a parallel face a few cm away
+                        d = np.abs(offs - off)
+                        return bool(np.any((d > near_lo) & (d < near_hi) & (los < a1) & (his > a0)))
+
+                    for k in sel_all:
+                        if (lo[k] >= t_lo - eps and hi[k] <= t_hi + eps
+                                and not twin(rho[k], lo[k], hi[k], rho, lo, hi)):
+                            keys.add(_seg_key(A[idx[k], :2], A[idx[k], 2:]))
+                    for k in np.nonzero(inside)[0]:
+                        if (clo[k] >= box_lo - eps and chi[k] <= box_hi + eps
+                                and t_lo - eps <= cpos[k] <= t_hi + eps
+                                and not twin(cpos[k], clo[k], chi[k], cpos, clo, chi)):
+                            keys.add(_seg_key(A[cidx[k], :2], A[cidx[k], 2:]))
+                elif (len(members) >= 6 and 0.2 * scale <= dsp <= 0.35 * scale
+                      and np.mean(np.abs(length - np.median(length)) <= 0.3 * np.median(length)) >= 0.8
+                      and 0.7 * scale <= np.median(length) <= 2.2 * scale):
+                    a0, a1 = float(np.median(lo[sel])), float(np.median(hi[sel]))
+                    r0, r1 = rr[i], rr[j]
+                    P = lambda t, q: (t * ux - q * uy, t * uy + q * ux)
+                    stairs.append([P(a0, r0), P(a1, r0), P(a1, r1), P(a0, r1)])
+    return keys, stairs
 
 
 def _visible(segs, mask, zoom):

@@ -6,6 +6,11 @@ app = QApplication([])
 from pdfsuite.pdf_document import PdfDocument
 import importlib
 rd = importlib.import_module(os.environ.get("RD", "pdfsuite.room_detect"))
+_op = rd._patterns
+if os.environ.get("NOGRID"):
+    rd._patterns = lambda *a: (set(), _op(*a)[1])
+if os.environ.get("NOSTAIR"):
+    rd._patterns = lambda *a: (_op(*a)[0], [])
 if os.environ.get("SCRAMBLE"):
     rd._is_wall_layer = lambda n: False
     rd._is_opening_layer = lambda n: False
