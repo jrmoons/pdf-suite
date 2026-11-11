@@ -7,17 +7,22 @@ from PySide6.QtGui import QAction, QActionGroup, QColor, QKeySequence
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QTabWidget, QWidget, QHBoxLayout, QSplitter,
     QToolBar, QFileDialog, QMessageBox, QInputDialog, QLabel, QDialog,
-    QColorDialog, QLineEdit, QComboBox, QProgressDialog,
+    QColorDialog, QLineEdit, QComboBox, QProgressDialog, QSlider, QToolButton,
+    QSpinBox,
 )
+import math
 
 from .pdf_document import PdfDocument, STAMP_COLORS
 from .page_view import PdfGraphicsView
 from .thumbnail_panel import ThumbnailPanel
 from .tools import Tool
 from .dialogs import (
-    ask_password, ask_page_ranges, TextEditDialog, SignatureDialog, ScaleDialog,
+    ask_password, ask_page_ranges, TextEditDialog, SignatureDialog,
 )
 from .ribbon import Ribbon
+from .settings import app_settings
+from .measure_bar import MeasureBar
+from .page_view import MEASURE_TOOLS
 from . import theme as theme_mod
 from .icons import make_icon
 
@@ -79,7 +84,7 @@ class MainWindow(QMainWindow):
         self._current_color = (0.9, 0.1, 0.1)
         self._signature_png: bytes | None = None
 
-        self.settings = QSettings("PDFSuite", "PDFSuite")
+        self.settings = app_settings()
         self._dark = bool(self.settings.value("dark_theme", False, type=bool))
 
         self._build_actions()
@@ -185,7 +190,7 @@ class MainWindow(QMainWindow):
 
         # measures / plans
         self.act_scale = self._act("Échelle", self.choose_scale, "scale",
-                                   tip="Choisir l'échelle du plan (1:50, 1:100…) ou la calibrer")
+                                   tip="Régler l'échelle du plan dans la barre « Mesure »")
         self.act_export_measures = self._act("Exporter mesures", self.export_measures, "export",
                                              tip="Toutes les mesures du document vers Excel (CSV)")
         self.act_compare = self._act("Comparer", self.compare_plans, "compare",
@@ -208,11 +213,17 @@ class MainWindow(QMainWindow):
         self.act_set_password = self._act("Mot de passe", self.set_password, "password")
 
         # view
-        self.act_zoom_in = self._act("Zoom +", lambda: self.zoom_by(1.15), "zoomin",
+        self.act_zoom_in = self._act("Zoom +", lambda: self.zoom_by(1.25), "zoomin",
                                      shortcut=QKeySequence.ZoomIn)
-        self.act_zoom_out = self._act("Zoom -", lambda: self.zoom_by(1 / 1.15), "zoomout",
+        self.act_zoom_out = self._act("Zoom -", lambda: self.zoom_by(1 / 1.25), "zoomout",
                                       shortcut=QKeySequence.ZoomOut)
-        self.act_zoom_100 = self._act("Zoom 100%", lambda: self.zoom_to(1.33))
+        self.act_zoom_100 = self._act("Taille réelle", lambda: self.zoom_to(1.33),
+                                      shortcut="Ctrl+0")
+        self.act_fit_width = self._act("Pleine largeur", self.fit_width, shortcut="Ctrl+2")
+        self.act_fit_page = self._act("Page entière", self.fit_page, shortcut="Ctrl+1")
+        self.act_rulers = self._act("Règles", self.toggle_rulers, checkable=True,
+                                    tip="Règles graduées (unités réelles si l'échelle est connue)")
+        self.act_rulers.setChecked(bool(self.settings.value("rulers", True, type=bool)))
         self.act_loupe = self._act("Loupe", self.toggle_loupe, "loupe", checkable=True,
                                    tip="Loupe qui suit la souris")
         self.act_invert = self._act("Inverser couleurs", self.toggle_invert, "invert",
@@ -304,25 +315,77 @@ class MainWindow(QMainWindow):
         protect.addAction(self.act_set_password)
 
         view = self.ribbon.add_page("Affichage")
-        for a in (self.act_zoom_out, self.act_zoom_in, self.act_zoom_100):
+        for a in (self.act_zoom_out, self.act_zoom_in, self.act_zoom_100, self.act_fit_width,
+                  self.act_fit_page):
             view.addAction(a)
         view.addSeparator()
-        for a in (self.act_loupe, self.act_invert, self.act_split_view, self.act_grid):
+        for a in (self.act_rulers, self.act_loupe, self.act_invert, self.act_split_view,
+                  self.act_grid):
             view.addAction(a)
         view.addSeparator()
         view.addAction(self.act_toggle_theme)
 
+        # properties bar for measurements, right under the ribbon
+        self.addToolBarBreak()
+        self.measure_bar = MeasureBar()
+        self.measure_holder = QToolBar("Propriétés")
+        self.measure_holder.setMovable(False)
+        self.measure_holder.setFloatable(False)
+        self.measure_holder.addWidget(self.measure_bar)
+        self.addToolBar(self.measure_holder)
+        self.measure_bar.applied.connect(self._on_measure_settings)
+        self.measure_bar.colorChanged.connect(self._on_measure_color)
+        self.measure_bar.calibrateRequested.connect(self.start_calibration)
+
         self.ribbon.set_current(int(self.settings.value("ribbon_tab", 0, type=int)))
-        self.ribbon.currentChanged.connect(lambda i: self.settings.setValue("ribbon_tab", i))
+        self.ribbon.currentChanged.connect(self._on_ribbon_tab)
+        self._update_measure_bar_visibility()
         self._update_theme_action()
+
+    ZOOM_PRESETS = [10, 25, 50, 75, 100, 125, 150, 200, 300, 400, 600, 800, 1200]
 
     def _build_statusbar(self):
         sb = self.statusBar()
+        self.size_label = QLabel("")
         self.cursor_label = QLabel("")
+        self.cursor_label.setMinimumWidth(190)
         self.scale_label = QLabel("")
-        self.page_label = QLabel("Page — / —")
-        self.zoom_label = QLabel("100%")
-        for w in (self.cursor_label, self.scale_label, self.page_label, self.zoom_label):
+        for w in (self.size_label, self.cursor_label, self.scale_label):
+            sb.addPermanentWidget(w)
+
+        # page navigation
+        self.btn_prev = QToolButton(text="◀", autoRaise=True)
+        self.page_spin = QSpinBox()
+        self.page_spin.setMinimum(1)
+        self.page_spin.setButtonSymbols(QSpinBox.NoButtons)
+        self.page_spin.setAlignment(Qt.AlignCenter)
+        self.page_spin.setFixedWidth(46)
+        self.page_label = QLabel("/ —")
+        self.btn_next = QToolButton(text="▶", autoRaise=True)
+        self.btn_prev.clicked.connect(lambda: self._goto_relative(-1))
+        self.btn_next.clicked.connect(lambda: self._goto_relative(1))
+        self.page_spin.editingFinished.connect(
+            lambda: self.current_tab() and self.current_tab().view.goto_page(self.page_spin.value() - 1))
+        for w in (self.btn_prev, self.page_spin, self.page_label, self.btn_next):
+            sb.addPermanentWidget(w)
+
+        # zoom: - [slider] + [combo %]
+        self.btn_zoom_out = QToolButton(text="−", autoRaise=True)
+        self.zoom_slider = QSlider(Qt.Horizontal)
+        self.zoom_slider.setRange(0, 1000)
+        self.zoom_slider.setFixedWidth(130)
+        self.btn_zoom_in = QToolButton(text="+", autoRaise=True)
+        self.zoom_combo = QComboBox()
+        self.zoom_combo.setEditable(True)
+        self.zoom_combo.addItems([f"{z} %" for z in self.ZOOM_PRESETS] + ["Pleine largeur", "Page entière"])
+        self.zoom_combo.setFixedWidth(118)
+        self.zoom_label = self.zoom_combo      # kept for older code paths
+        self.btn_zoom_out.clicked.connect(lambda: self.zoom_by(1 / 1.25))
+        self.btn_zoom_in.clicked.connect(lambda: self.zoom_by(1.25))
+        self.zoom_slider.valueChanged.connect(self._on_zoom_slider)
+        self.zoom_combo.activated.connect(self._on_zoom_combo)
+        self.zoom_combo.lineEdit().returnPressed.connect(self._on_zoom_combo)
+        for w in (self.btn_zoom_out, self.zoom_slider, self.btn_zoom_in, self.zoom_combo):
             sb.addPermanentWidget(w)
 
     def _update_actions_enabled(self):
@@ -330,6 +393,9 @@ class MainWindow(QMainWindow):
         for a in self._doc_actions:
             a.setEnabled(has_doc)
         self.stamp_combo.setEnabled(has_doc)
+        for w in (self.btn_prev, self.btn_next, self.page_spin, self.btn_zoom_in,
+                  self.btn_zoom_out, self.zoom_slider, self.zoom_combo):
+            w.setEnabled(has_doc)
 
     # -- theme ----------------------------------------------------------
     def _update_theme_action(self):
@@ -360,17 +426,20 @@ class MainWindow(QMainWindow):
 
     def _on_tab_changed(self, _index):
         tab = self.current_tab()
+        self.measure_bar.set_document(tab.pdf_document if tab else None)
         if tab is not None:
             for v in tab.views():
                 v.set_tool(self._current_tool)
                 v.set_color(self._current_color)
             self._update_page_label(tab.view.current_page())
-            self.zoom_label.setText(f"{int(tab.view.zoom / 1.33 * 100)}%")
+            self._show_zoom(tab.view.zoom)
             self.act_grid.setChecked(tab.view.show_grid)
             self.act_snap.setChecked(tab.view.snap_to_grid)
             self.act_invert.setChecked(tab.view.invert_colors)
             self.act_split_view.setChecked(tab.view2 is not None)
             self.act_form_mode.setChecked(tab.view.form_mode)
+            for v in tab.views():
+                v._update_rulers()
         self._update_scale_label()
         self._update_actions_enabled()
 
@@ -378,7 +447,13 @@ class MainWindow(QMainWindow):
         tab = self.current_tab()
         if tab is None:
             return
-        self.page_label.setText(f"Page {page_no + 1} / {tab.pdf_document.page_count}")
+        n = tab.pdf_document.page_count
+        self.page_spin.blockSignals(True)
+        self.page_spin.setMaximum(max(1, n))
+        self.page_spin.setValue(page_no + 1)
+        self.page_spin.blockSignals(False)
+        self.page_label.setText(f"/ {n}")
+        self.size_label.setText(tab.view.page_size_text())
 
     def _update_scale_label(self):
         tab = self.current_tab()
@@ -411,6 +486,7 @@ class MainWindow(QMainWindow):
         self._add_document_tab(doc, os.path.basename(path))
 
     def _add_document_tab(self, doc: PdfDocument, title: str) -> DocumentTab:
+        self.measure_bar.apply_defaults(doc)     # unit / precision before first display
         tab = DocumentTab(doc)
         self._wire_view(tab, tab.view)
         tab.thumbnails.deletePagesRequested.connect(
@@ -440,11 +516,107 @@ class MainWindow(QMainWindow):
         view.statusMessage.connect(lambda msg: self.statusBar().showMessage(msg, 5000))
         view.cursorInfo.connect(self.cursor_label.setText)
         view.requestSelectTool.connect(lambda: self._activate_tool(Tool.SELECT))
+        view.set_measure_color(self.measure_bar.color)
+        view.set_rulers(self.act_rulers.isChecked())
+        view.scaleRequired.connect(self._on_scale_required)
+        view.scaleCalibrated.connect(lambda t=tab: self._on_measure_settings())
 
     def _on_zoom_changed(self, tab: DocumentTab, zoom: float):
         if self.current_tab() is tab:
-            self.zoom_label.setText(f"{int(zoom / 1.33 * 100)}%")
+            self._show_zoom(zoom)
             self._update_scale_label()
+
+    # zoom slider: logarithmic 5 % .. 1600 %
+    _ZMIN, _ZMAX = math.log(0.05), math.log(16.0)
+
+    def _show_zoom(self, zoom: float):
+        pct = zoom / 1.33 * 100
+        self.zoom_combo.blockSignals(True)
+        self.zoom_combo.setEditText(f"{pct:.0f} %")
+        self.zoom_combo.blockSignals(False)
+        self.zoom_slider.blockSignals(True)
+        v = (math.log(max(zoom, 0.05)) - self._ZMIN) / (self._ZMAX - self._ZMIN) * 1000
+        self.zoom_slider.setValue(int(v))
+        self.zoom_slider.blockSignals(False)
+
+    def _on_zoom_slider(self, value: int):
+        zoom = math.exp(self._ZMIN + value / 1000 * (self._ZMAX - self._ZMIN))
+        self.zoom_to(zoom)
+
+    def _on_zoom_combo(self, *_):
+        text = self.zoom_combo.currentText().strip()
+        if text == "Pleine largeur":
+            self.fit_width()
+            return
+        if text == "Page entière":
+            self.fit_page()
+            return
+        try:
+            pct = float(text.replace("%", "").replace(",", ".").strip())
+        except ValueError:
+            return
+        self.zoom_to(pct / 100 * 1.33)
+
+    def _goto_relative(self, delta: int):
+        tab = self.current_tab()
+        if tab is not None:
+            tab.view.goto_page(tab.view.current_page() + delta)
+
+    def fit_width(self):
+        tab = self.current_tab()
+        if tab is not None:
+            tab.view.fit_width()
+
+    def fit_page(self):
+        tab = self.current_tab()
+        if tab is not None:
+            tab.view.fit_page()
+
+    def toggle_rulers(self, checked: bool):
+        self.settings.setValue("rulers", checked)
+        for i in range(self.tabs.count()):
+            for v in self.tabs.widget(i).views():
+                v.set_rulers(checked)
+
+    # -- measurement properties bar -----------------------------------
+    def _on_ribbon_tab(self, index: int):
+        self.settings.setValue("ribbon_tab", index)
+        self._update_measure_bar_visibility()
+
+    def _update_measure_bar_visibility(self):
+        on_tab = self.ribbon.page_titles()[self.ribbon.tab_bar.currentIndex()] == "Mesures" \
+            if self.ribbon.tab_bar.count() else False
+        visible = on_tab or self._current_tool in MEASURE_TOOLS
+        self.measure_holder.setVisible(visible)
+
+    def _on_measure_settings(self):
+        tab = self.current_tab()
+        if tab is None:
+            return
+        self.measure_bar.refresh()
+        for v in tab.views():
+            v.rebuild_annotations()
+            v.viewport().update()
+            v._update_rulers()
+        self._on_doc_modified(tab)
+        self.size_label.setText(tab.view.page_size_text())
+
+    def _on_measure_color(self, rgb):
+        for i in range(self.tabs.count()):
+            for v in self.tabs.widget(i).views():
+                v.set_measure_color(rgb)
+
+    def _on_scale_required(self):
+        self.measure_holder.setVisible(True)
+        self.measure_bar.flash_warning()
+
+    def start_calibration(self):
+        tab = self.current_tab()
+        if tab is None:
+            return
+        self._activate_tool(Tool.MEASURE_LINE)
+        for v in tab.views():
+            v.start_calibration()
 
     def _on_doc_modified(self, tab: DocumentTab, source_view: PdfGraphicsView | None = None):
         idx = self.tabs.indexOf(tab)
@@ -514,7 +686,7 @@ class MainWindow(QMainWindow):
                 if not self.save_current():
                     return
         for v in tab.views():
-            v.set_loupe(False)
+            v.shutdown()
         tab.pdf_document.close()
         self.tabs.removeTab(index)
 
@@ -525,6 +697,8 @@ class MainWindow(QMainWindow):
         if tab is not None:
             for v in tab.views():
                 v.set_tool(tool)
+        if hasattr(self, "measure_holder"):
+            self._update_measure_bar_visibility()
 
     def _activate_tool(self, tool: Tool):
         self._tool_actions[tool].setChecked(True)
@@ -573,25 +747,8 @@ class MainWindow(QMainWindow):
 
     # -- plans / measures ----------------------------------------------
     def choose_scale(self):
-        tab = self.current_tab()
-        if tab is None:
-            return
-        doc = tab.pdf_document
-        dlg = ScaleDialog(self, doc.scale_description())
-        if dlg.exec() != QDialog.Accepted:
-            return
-        ratio = dlg.ratio()
-        if ratio is None:
-            doc.scale_points_per_meter = None
-            self._activate_tool(Tool.MEASURE_LINE)
-            self.statusBar().showMessage(
-                "Tracez une ligne de longueur connue : sa longueur réelle vous sera demandée.", 8000)
-        else:
-            doc.set_ratio_scale(ratio)
-        for v in tab.views():
-            v.rebuild_annotations()
-            v.viewport().update()
-        self._on_doc_modified(tab)
+        self.measure_holder.setVisible(True)
+        self.measure_bar.flash_warning()
 
     def reset_scale(self):
         tab = self.current_tab()
@@ -712,7 +869,8 @@ class MainWindow(QMainWindow):
             v2.set_zoom(tab.view.zoom)
             v2.set_grid(tab.view.show_grid)
             v2.snap_to_grid = tab.view.snap_to_grid
-            v2.invert_colors = tab.view.invert_colors
+            if tab.view.invert_colors:
+                v2.set_invert(True)
             v2.set_loupe(self.act_loupe.isChecked())
             tab.view2 = v2
             tab.view_splitter.addWidget(v2)
@@ -722,7 +880,7 @@ class MainWindow(QMainWindow):
         elif not checked and tab.view2 is not None:
             v2 = tab.view2
             tab.view2 = None
-            v2.set_loupe(False)
+            v2.shutdown()
             v2.setParent(None)
             v2.deleteLater()
 
@@ -737,7 +895,6 @@ class MainWindow(QMainWindow):
         if tab is None:
             return
         tab.view.set_zoom(zoom)
-        self.zoom_label.setText(f"{int(zoom / 1.33 * 100)}%")
 
     # -- page operations ----------------------------------------------
     def _refresh_thumbs(self, tab: DocumentTab):

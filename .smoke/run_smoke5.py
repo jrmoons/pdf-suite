@@ -1,3 +1,5 @@
+import os as _os; _os.environ["PDFSUITE_SETTINGS"] = "PDFSuiteTests"
+from PySide6.QtCore import QSettings as _QS; _QS("PDFSuite", "PDFSuiteTests").clear()  # fresh test settings
 import sys, os, math
 sys.path.insert(0, os.path.abspath("."))
 
@@ -27,7 +29,7 @@ item = view.page_items[0]
 def send(pdf_point, button, kind):
     page = view.doc.page(0)
     vis = pdf_point * ~page.derotation_matrix
-    scene_pos = item.pos() + QPointF(vis.x * view.zoom, vis.y * view.zoom)
+    scene_pos = item.pos() + QPointF(vis.x, vis.y)
     viewport_pos = view.mapFromScene(scene_pos)
     global_pos = view.viewport().mapToGlobal(viewport_pos)
     ev = QMouseEvent(kind, QPointF(viewport_pos), QPointF(global_pos),
@@ -97,7 +99,7 @@ print("measure line label:", ml.label)
 print("measure line has 2 handles:", len(ml.handles) == 2)
 
 # -- 7. drag a handle, verify live label + pdf sync ------------------------
-zoom = view.zoom
+zoom = 1.0  # scene units = PDF points
 new_pixel_pos = QPointF(ml.handles[1].pos().x() + 100 * zoom, ml.handles[1].pos().y())
 ml.handles[1].setPos(new_pixel_pos)  # triggers itemChange -> handle_moving
 ml.handle_released()

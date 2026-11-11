@@ -1,3 +1,12 @@
+"""Page view.
+
+Scene units are PDF points (``scene_scale`` = 1): the scene is built once
+per document structure, and **zooming only changes the view transform** -
+no rebuild, no full-page re-render, so zoom in / out is instant even on
+huge plans. Each page shows a capped-resolution *base* image stretched to
+its size, plus a sharp *detail* tile of the visible area, rendered at the
+exact screen resolution once scrolling/zooming pauses.
+"""
 from __future__ import annotations
 
 import datetime
@@ -6,12 +15,14 @@ import math
 
 import pymupdf
 from PySide6.QtCore import Qt, QPointF, QRectF, QRect, QSize, QSizeF, QTimer, Signal
-from PySide6.QtGui import QImage, QPixmap, QPen, QColor, QPainterPath, QBrush, QPainter
+from PySide6.QtGui import (
+    QImage, QPixmap, QPen, QColor, QPainterPath, QBrush, QPainter, QTransform, QFont,
+)
 from PySide6.QtWidgets import (
     QGraphicsView, QGraphicsScene, QGraphicsItem, QGraphicsRectItem,
     QGraphicsEllipseItem, QGraphicsLineItem, QGraphicsPathItem, QInputDialog,
     QGraphicsProxyWidget, QLineEdit, QCheckBox, QComboBox, QDialog, QLabel,
-    QApplication,
+    QApplication, QWidget,
 )
 
 from .tools import Tool, DRAG_TOOLS, POLY_TOOLS
@@ -20,6 +31,11 @@ from .dialogs import CalibrationDialog
 from . import annotation_items as ai
 
 GAP = 14
+BASE_MAX_PX = 2600        # longest side of a page's base image
+DETAIL_DELAY_MS = 120     # pause before the sharp tile is rendered
+MIN_ZOOM, MAX_ZOOM = 0.05, 16.0
+RULER = 22                # ruler thickness in pixels
+MEASURE_TOOLS = {Tool.MEASURE_LINE, Tool.MEASURE_PERIMETER, Tool.MEASURE_AREA}
 
 
 def _rect_to_quad(r: pymupdf.Rect) -> pymupdf.Quad:
@@ -32,33 +48,26 @@ def pixmap_to_qpixmap(pix: pymupdf.Pixmap) -> QPixmap:
     return QPixmap.fromImage(img)
 
 
-# Performance: a page is never rasterised at full zoom. It gets one *base*
-# image whose longest side is capped (BASE_MAX_PX), drawn stretched to the
-# page size - so zooming is instant - plus a sharp *detail* tile rendered at
-# the exact zoom for the visible part only, once scrolling/zooming pauses.
-BASE_MAX_PX = 2600
-DETAIL_DELAY_MS = 140
-
-
 class PageItem(QGraphicsItem):
-    def __init__(self, page_no: int, width_px: float, height_px: float):
+    """One page, in PDF points. Draws base + detail images, never re-renders
+    by itself."""
+
+    def __init__(self, page_no: int, width: float, height: float):
         super().__init__()
         self.page_no = page_no
-        self.size = QSizeF(width_px, height_px)
+        self.size = QSizeF(width, height)
         self.base: QPixmap | None = None
-        self.base_zoom = 0.0          # zoom the base image was rendered at
+        self.base_zoom = 0.0
         self.detail: QPixmap | None = None
-        self.detail_rect = QRectF()   # local (zoomed px) rect covered by detail
+        self.detail_rect = QRectF()    # local points covered by the detail tile
         self.detail_zoom = 0.0
-        self.annot_items: list = []   # top-level vector items + their handles
-        self.setFlag(QGraphicsItem.ItemUsesExtendedStyleOption, True)
+        self.annot_items: list = []
 
     @property
     def rendered(self) -> bool:
         return self.base is not None
 
     def page_rect(self) -> QRectF:
-        """Scene rect of the page."""
         return QRectF(self.pos(), self.size)
 
     def boundingRect(self) -> QRectF:
@@ -75,6 +84,108 @@ class PageItem(QGraphicsItem):
             painter.drawPixmap(self.detail_rect, self.detail, QRectF(self.detail.rect()))
 
 
+# -- rulers -------------------------------------------------------------------
+def _nice_step(raw: float) -> float:
+    if raw <= 0:
+        return 1.0
+    exp = 10 ** math.floor(math.log10(raw))
+    for m in (1, 2, 5, 10):
+        if m * exp >= raw:
+            return m * exp
+    return 10 * exp
+
+
+class Ruler(QWidget):
+    """Graduated ruler in real units (paper cm when no scale is set),
+    origin at the top-left corner of the current page."""
+
+    def __init__(self, view: "PdfGraphicsView", horizontal: bool):
+        super().__init__(view)
+        self.view = view
+        self.horizontal = horizontal
+        self.cursor_px: float | None = None
+        self.setAttribute(Qt.WA_OpaquePaintEvent)
+
+    def paintEvent(self, event):
+        v = self.view
+        p = QPainter(self)
+        bg = v.palette().window().color()
+        fg = v.palette().windowText().color()
+        p.fillRect(self.rect(), bg)
+        p.setPen(QPen(fg.darker(130) if bg.lightness() > 128 else fg.lighter(80)))
+        item = v.page_items[v.current_page()] if v.page_items else None
+        if item is None:
+            return
+        # units per PDF point and label of the unit
+        upp, unit = v.units_per_point()
+        zoom = v.zoom
+        origin_vp = v.mapFromScene(item.pos())
+        origin = origin_vp.x() if self.horizontal else origin_vp.y()
+        # the ruler starts exactly where the viewport starts
+        length = self.width() if self.horizontal else self.height()
+        px_per_unit = zoom / upp
+        major = _nice_step(60 / px_per_unit)
+        lead = round(major / 10 ** math.floor(math.log10(major)))
+        minor = major / (4 if lead == 2 else 5)
+        f = QFont()
+        f.setPixelSize(10)
+        p.setFont(f)
+        k0 = math.floor((0 - origin) / px_per_unit / minor) - 1
+        k1 = math.ceil((length - origin) / px_per_unit / minor) + 1
+        if k1 - k0 > 3000:
+            return
+        for k in range(k0, k1 + 1):
+            u = k * minor
+            pos = origin + u * px_per_unit
+            if pos < 0 or pos > length:
+                continue
+            is_major = abs(u / major - round(u / major)) < 1e-6
+            tick = RULER * (0.6 if is_major else 0.25)
+            if self.horizontal:
+                p.drawLine(QPointF(pos, RULER), QPointF(pos, RULER - tick))
+                if is_major:
+                    p.drawText(QPointF(pos + 2, 10), _fmt_tick(u))
+            else:
+                p.drawLine(QPointF(RULER, pos), QPointF(RULER - tick, pos))
+                if is_major:
+                    p.save()
+                    p.translate(10, pos - 2)
+                    p.rotate(-90)
+                    p.drawText(QPointF(0, 0), _fmt_tick(u))
+                    p.restore()
+        if self.cursor_px is not None:
+            p.setPen(QPen(QColor(220, 40, 40), 1))
+            c = self.cursor_px
+            if self.horizontal:
+                p.drawLine(QPointF(c, 0), QPointF(c, RULER))
+            else:
+                p.drawLine(QPointF(0, c), QPointF(RULER, c))
+        p.setPen(QPen(fg.darker(150)))
+        if self.horizontal:
+            p.drawLine(0, RULER - 1, self.width(), RULER - 1)
+        else:
+            p.drawLine(RULER - 1, 0, RULER - 1, self.height())
+
+
+def _fmt_tick(u: float) -> str:
+    if abs(u - round(u)) < 1e-6:
+        return str(int(round(u)))
+    return f"{u:g}".replace(".", ",")
+
+
+class MeasureInfo(QLabel):
+    """Live measurement panel (distance, angle, ΔX, ΔY, scale, precision)."""
+
+    def __init__(self, view):
+        super().__init__(view.viewport())
+        self.setTextFormat(Qt.RichText)
+        self.setAttribute(Qt.WA_TransparentForMouseEvents)
+        self.setStyleSheet(
+            "QLabel { background: rgba(250,250,252,235); color: #1c1c1e;"
+            " border: 1px solid #b9bec7; border-radius: 6px; padding: 6px 10px; }")
+        self.hide()
+
+
 class PdfGraphicsView(QGraphicsView):
     pageChanged = Signal(int)
     zoomChanged = Signal(float)
@@ -84,6 +195,10 @@ class PdfGraphicsView(QGraphicsView):
     requestSignaturePlacement = Signal(int, object)
     requestSelectTool = Signal()      # Échap : retour à l'outil Sélection
     cursorInfo = Signal(str)          # coordonnées sous le curseur
+    scaleRequired = Signal()          # mesure tentée sans échelle
+    scaleCalibrated = Signal()
+
+    scene_scale = 1.0                 # scene units = PDF points
 
     def __init__(self, document: PdfDocument, parent=None):
         super().__init__(parent)
@@ -91,15 +206,19 @@ class PdfGraphicsView(QGraphicsView):
         self.zoom = 1.33
         self.tool = Tool.SELECT
         self.current_color = (0.9, 0.1, 0.1)
+        self.measure_color = (0.0, 0.45, 0.85)
         self.page_items: list[PageItem] = []
 
         self._scene = QGraphicsScene(self)
         self.setScene(self._scene)
-        self.setRenderHints(self.renderHints())
         self.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        self.setTransformationAnchor(QGraphicsView.AnchorUnderMouse)
         self.setResizeAnchor(QGraphicsView.AnchorViewCenter)
+        self.setViewportUpdateMode(QGraphicsView.SmartViewportUpdate)
+        self.setOptimizationFlag(QGraphicsView.DontAdjustForAntialiasing, True)
         self.setBackgroundBrush(QBrush(QColor(60, 63, 68)))
         self.setFocusPolicy(Qt.StrongFocus)
+        self.setMouseTracking(True)
 
         self._dragging = False
         self._drag_page = -1
@@ -109,111 +228,143 @@ class PdfGraphicsView(QGraphicsView):
         self.form_mode = False
         self._form_proxies: list = []
 
-        # state for the click-to-add-vertex perimeter tool
         self._poly_page = -1
         self._poly_points: list = []
         self._poly_preview_item = None
 
-        # plan-reading aids
         self.show_grid = False
         self.snap_to_grid = False
         self.invert_colors = False
         self.stamp_label = "APPROUVÉ"
         self._loupe: QLabel | None = None
         self.loupe_enabled = False
+        self.calibrating = False
+
+        # rulers in the viewport margins
+        self.rulers_visible = True
+        self._hruler = Ruler(self, True)
+        self._vruler = Ruler(self, False)
+        self._measure_info = MeasureInfo(self)
+
+        self._detail_timer = QTimer(self)
+        self._detail_timer.setSingleShot(True)
+        self._detail_timer.timeout.connect(self._render_pending)
 
         self.verticalScrollBar().valueChanged.connect(self._on_scrolled)
+        self.horizontalScrollBar().valueChanged.connect(self._on_scrolled)
+        self.setTransform(QTransform.fromScale(self.zoom, self.zoom))
+        self.set_rulers(True)
         self.build_scene()
 
     # ------------------------------------------------------------------
     def set_tool(self, tool: Tool):
         if self.tool in POLY_TOOLS and tool != self.tool:
             self._cancel_polygon()
+        if tool not in MEASURE_TOOLS:
+            self.calibrating = False
         self.tool = tool
         self.setDragMode(
             QGraphicsView.ScrollHandDrag if tool == Tool.PAN else QGraphicsView.NoDrag
         )
+        self._show_measure_info(None)
 
     def set_color(self, rgb: tuple[float, float, float]):
         self.current_color = rgb
 
+    def set_measure_color(self, rgb):
+        self.measure_color = rgb
+
     def apply_theme(self, surround_color: QColor):
         self.setBackgroundBrush(QBrush(surround_color))
+        self._hruler.update()
+        self._vruler.update()
 
-    # -- ctrl+wheel zoom, centred on the cursor --------------------------
+    # -- rulers ---------------------------------------------------------
+    def set_rulers(self, visible: bool):
+        self.rulers_visible = visible
+        m = RULER if visible else 0
+        self.setViewportMargins(m, m, 0, 0)
+        self._hruler.setVisible(visible)
+        self._vruler.setVisible(visible)
+        self._place_rulers()
+
+    def _place_rulers(self):
+        cr = self.contentsRect()
+        self._hruler.setGeometry(cr.left() + RULER, cr.top(), cr.width() - RULER, RULER)
+        self._vruler.setGeometry(cr.left(), cr.top() + RULER, RULER, cr.height() - RULER)
+
+    def units_per_point(self) -> tuple[float, str]:
+        """Ruler/cursor unit: the real unit when the scale is known,
+        otherwise centimetres of paper."""
+        if self.doc.scale_points_per_meter:
+            return self.doc.to_unit(1.0), self.doc.unit
+        return 2.54 / 72, "cm"
+
+    def _update_rulers(self):
+        if self.rulers_visible:
+            self._hruler.update()
+            self._vruler.update()
+
+    # -- zoom (view transform only: instant) ------------------------------
     def wheelEvent(self, event):
         if event.modifiers() & Qt.ControlModifier:
             angle = event.angleDelta().y()
-            if angle == 0:
-                event.accept()
-                return
-            viewport_pos = event.position().toPoint()
-            factor = 1.15 if angle > 0 else 1 / 1.15
-            target = getattr(self, "_pending_zoom", None) or self.zoom
-            new_zoom = max(0.2, min(8.0, target * factor))
-            self._preview_zoom(new_zoom, viewport_pos)
+            if angle:
+                factor = 1.2 ** (angle / 120)
+                self.set_zoom(self.zoom * factor, under_mouse=True)
             event.accept()
             return
         super().wheelEvent(event)
 
-    def _fraction_at(self, viewport_pos):
-        scene_pos = self.mapToScene(viewport_pos)
-        item = self._item_at_scene(scene_pos)
-        if item is None:
-            return None
-        size = item.size
-        if size.width() == 0 or size.height() == 0:
-            return None
-        local = scene_pos - item.pos()
-        return item.page_no, local.x() / size.width(), local.y() / size.height()
-
-    def _recenter_on_fraction(self, page_no, fx, fy, viewport_pos):
-        if not (0 <= page_no < len(self.page_items)):
+    def set_zoom(self, zoom: float, under_mouse: bool = False):
+        zoom = max(MIN_ZOOM, min(MAX_ZOOM, zoom))
+        if abs(zoom - self.zoom) < 1e-9:
             return
-        item = self.page_items[page_no]
-        size = item.size
-        target = item.pos() + QPointF(fx * size.width(), fy * size.height())
-        self.verticalScrollBar().setValue(int(target.y() - viewport_pos.y()))
-        hbar = self.horizontalScrollBar()
-        if hbar.maximum() > 0:
-            hbar.setValue(int(target.x() - viewport_pos.x()))
+        self.setTransformationAnchor(
+            QGraphicsView.AnchorUnderMouse if under_mouse else QGraphicsView.AnchorViewCenter)
+        self.setTransform(QTransform.fromScale(zoom, zoom))
+        self.setTransformationAnchor(QGraphicsView.AnchorUnderMouse)
+        self.zoom = zoom
+        self.zoomChanged.emit(zoom)
+        self._update_rulers()
+        self._schedule_detail()
+
+    def fit_width(self):
+        if not self.page_items:
+            return
+        w = max(it.size.width() for it in self.page_items)
+        self.set_zoom((self.viewport().width() - 24) / max(w, 1))
+
+    def fit_page(self):
+        if not self.page_items:
+            return
+        it = self.page_items[self.current_page()]
+        vw, vh = self.viewport().width() - 24, self.viewport().height() - 24
+        self.set_zoom(min(vw / it.size.width(), vh / it.size.height()))
+        self.goto_page(it.page_no)
 
     # ------------------------------------------------------------------
-    def build_scene(self, keep_page: int | None = None, reuse_images: bool = False):
-        # On a zoom change, keep the already-rendered base images: shown
-        # stretched right away, re-rendered later (debounced) only if the
-        # zoom changed a lot. Never reused when pages may have changed.
-        old_bases = {it.page_no: (it.base, it.base_zoom) for it in self.page_items
-                     if it.base is not None} if reuse_images else {}
+    def build_scene(self, keep_page: int | None = None):
         self._scene.clear()
         self.page_items = []
-        max_w = 0.0
-        sizes = []
-        for i in range(self.doc.page_count):
-            w, h = self.doc.visual_size(i)
-            sizes.append((w, h))
-            max_w = max(max_w, w * self.zoom)
-
+        sizes = [self.doc.visual_size(i) for i in range(self.doc.page_count)]
+        max_w = max((w for w, _ in sizes), default=0.0)
         y = GAP
         for i, (w, h) in enumerate(sizes):
-            pw, ph = w * self.zoom, h * self.zoom
-            item = PageItem(i, pw, ph)
-            if i in old_bases:
-                item.base, item.base_zoom = old_bases[i]
-            item.setPos((max_w - pw) / 2, y)
+            item = PageItem(i, w, h)
+            item.setPos((max_w - w) / 2 + GAP, y)
             item.setZValue(0)
             self._scene.addItem(item)
             self.page_items.append(item)
             self._rebuild_page_annotations(item)
-            y += ph + GAP
-
-        self._scene.setSceneRect(0, 0, max_w, y)
+            y += h + GAP
+        self._scene.setSceneRect(0, 0, max_w + 2 * GAP, y)
         if keep_page is not None and 0 <= keep_page < len(self.page_items):
             self.goto_page(keep_page)
-        self._update_visible(render_now=not old_bases)
         self._form_proxies = []
         if self.form_mode:
             self._add_form_widgets()
+        self._update_visible()
 
     # -- vector annotation layer ------------------------------------------
     def _rebuild_page_annotations(self, item: PageItem):
@@ -242,6 +393,21 @@ class PdfGraphicsView(QGraphicsView):
         if item is not None and qitem in item.annot_items:
             item.annot_items.remove(qitem)
 
+    def rebuild_annotations(self):
+        for item in self.page_items:
+            self._rebuild_page_annotations(item)
+
+    def _refresh_labels(self):
+        """Measure labels keep a constant on-screen size: resize them after
+        a zoom change (only for visible pages)."""
+        visible = self.mapToScene(self.viewport().rect()).boundingRect()
+        for item in self.page_items:
+            if not item.page_rect().intersects(visible):
+                continue
+            for obj in item.annot_items:
+                if hasattr(obj, "zoom_changed"):
+                    obj.zoom_changed()
+
     # -- form fields --------------------------------------------------
     def set_form_mode(self, enabled: bool):
         self.form_mode = enabled
@@ -253,7 +419,8 @@ class PdfGraphicsView(QGraphicsView):
 
     def _clear_form_widgets(self):
         for proxy in self._form_proxies:
-            self._scene.removeItem(proxy)
+            if proxy.scene() is not None:
+                self._scene.removeItem(proxy)
         self._form_proxies = []
 
     def _add_form_widgets(self):
@@ -263,11 +430,17 @@ class PdfGraphicsView(QGraphicsView):
                 editor = self._make_widget_editor(w)
                 if editor is None:
                     continue
+                r = pymupdf.Rect(w.rect)
+                f = editor.font()
+                f.setPixelSize(max(5, int(r.height * 0.62)))
+                editor.setFont(f)
+                editor.setStyleSheet("padding: 0px; margin: 0px;")
                 proxy = QGraphicsProxyWidget(item)
                 proxy.setWidget(editor)
-                r = pymupdf.Rect(w.rect)
-                proxy.setPos(r.x0 * self.zoom, r.y0 * self.zoom)
-                proxy.resize(r.width * self.zoom, r.height * self.zoom)
+                proxy.setMinimumSize(1, 1)
+                editor.setMinimumSize(1, 1)
+                proxy.setPos(r.x0, r.y0)
+                proxy.resize(r.width, r.height)
                 proxy.setZValue(5)
                 self._form_proxies.append(proxy)
 
@@ -302,58 +475,30 @@ class PdfGraphicsView(QGraphicsView):
         self.doc.mark_dirty()
         self.documentModified.emit()
 
-    def set_zoom(self, zoom: float):
-        cur = self.current_page()
-        self.resetTransform()
-        self._pending_zoom = None
-        self.zoom = max(0.2, min(8.0, zoom))
-        self.build_scene(keep_page=cur, reuse_images=True)
-        self.zoomChanged.emit(self.zoom)
-
-    # Ctrl+wheel: scale the current picture instantly (view transform), and
-    # rebuild the scene at the real zoom only once the wheel stops.
-    def _preview_zoom(self, new_zoom: float, viewport_pos):
-        if getattr(self, "_pending_zoom", None) is None:
-            self._zoom_anchor = self._fraction_at(viewport_pos)
-        self._zoom_anchor_pos = viewport_pos
-        self._pending_zoom = new_zoom
-        self.setTransformationAnchor(QGraphicsView.AnchorUnderMouse)
-        k = new_zoom / self.zoom
-        self.setTransform(self.transform().fromScale(k, k))
-        self.setTransformationAnchor(QGraphicsView.AnchorViewCenter)
-        self.zoomChanged.emit(new_zoom)
-        if not hasattr(self, "_zoom_timer"):
-            self._zoom_timer = QTimer(self)
-            self._zoom_timer.setSingleShot(True)
-            self._zoom_timer.timeout.connect(self._commit_zoom)
-        self._zoom_timer.start(180)
-
-    def _commit_zoom(self):
-        new_zoom = getattr(self, "_pending_zoom", None)
-        if new_zoom is None:
-            return
-        anchor = getattr(self, "_zoom_anchor", None)
-        pos = self._zoom_anchor_pos
-        # where is the anchor now, on screen, under the preview transform?
-        self.set_zoom(new_zoom)
-        if anchor is not None:
-            self._recenter_on_fraction(*anchor, pos)
-
+    # -- navigation ---------------------------------------------------------
     def current_page(self) -> int:
+        center_y = self.mapToScene(self.viewport().rect().center()).y()
         top = self.mapToScene(0, 0).y()
+        probe = top + (center_y - top) * 0.3
         for item in self.page_items:
-            if item.y() + item.size.height() > top:
+            if item.y() + item.size.height() > probe:
                 return item.page_no
         return max(0, len(self.page_items) - 1)
 
     def goto_page(self, n: int):
         if 0 <= n < len(self.page_items):
             item = self.page_items[n]
-            self.verticalScrollBar().setValue(int(item.y()) - GAP)
+            vp = self.mapFromScene(QPointF(item.x(), item.y() - GAP / 2))
+            vbar = self.verticalScrollBar()
+            vbar.setValue(vbar.value() + vp.y())
+
+    # -- rendering ----------------------------------------------------------
+    def _render_zoom(self) -> float:
+        return self.zoom * self.devicePixelRatioF()
 
     def _base_zoom_for(self, n: int) -> float:
         w, h = self.doc.visual_size(n)
-        return min(self.zoom, BASE_MAX_PX / max(w, h, 1))
+        return min(self._render_zoom(), BASE_MAX_PX / max(w, h, 1))
 
     def _to_qpixmap(self, pix) -> QPixmap:
         qpix = pixmap_to_qpixmap(pix)
@@ -364,9 +509,7 @@ class PdfGraphicsView(QGraphicsView):
         return qpix
 
     def refresh_page(self, n: int):
-        """Re-render the page's raster. Only needed when the page's actual
-        *content* changes (text edit, rotation, signature) - annotations
-        live in their own vector layer and never need this."""
+        """Re-render one page (its content changed: text edit, signature)."""
         if 0 <= n < len(self.page_items):
             item = self.page_items[n]
             bz = self._base_zoom_for(n)
@@ -378,75 +521,82 @@ class PdfGraphicsView(QGraphicsView):
             self._schedule_detail()
 
     def _schedule_detail(self):
-        if not hasattr(self, "_detail_timer"):
-            self._detail_timer = QTimer(self)
-            self._detail_timer.setSingleShot(True)
-            self._detail_timer.timeout.connect(self._render_pending)
         self._detail_timer.start(DETAIL_DELAY_MS)
 
+    def shutdown(self):
+        """Called before the document is closed: no more deferred work."""
+        self._closed = True
+        self._detail_timer.stop()
+        self.set_loupe(False)
+
     def _render_pending(self):
-        """After a pause: re-render stale base images of visible pages, then
-        a sharp tile of the visible area when zoomed in past the base."""
+        if getattr(self, "_closed", False) or self.doc.doc.is_closed:
+            return
         visible = self.mapToScene(self.viewport().rect()).boundingRect()
         far = visible.adjusted(0, -3 * visible.height(), 0, 3 * visible.height())
+        rz = self._render_zoom()
         for item in self.page_items:
             pr = item.page_rect()
             if not pr.intersects(visible):
-                item.detail = None          # free memory of off-screen tiles
+                item.detail = None
                 if not pr.intersects(far):
-                    item.base = None        # and of pages far away
+                    item.base = None
                 continue
             want = self._base_zoom_for(item.page_no)
-            # re-render only when more resolution is needed (zooming in) or
-            # the image is far too big for the new size (memory)
             if item.base is None or want > item.base_zoom * 1.15 or want < item.base_zoom / 3:
                 item.base = self._to_qpixmap(self.doc.render_page(item.page_no, want))
                 item.base_zoom = want
-            if self.zoom <= item.base_zoom * 1.05:
+                item.update()
+            if rz <= item.base_zoom * 1.05:
                 if item.detail is not None:
                     item.detail = None
                     item.update()
                 continue
-            area = pr.intersected(visible.adjusted(-60, -60, 60, 60))
-            local = area.translated(-pr.topLeft())
-            if (item.detail is not None and item.detail_zoom == self.zoom
+            local = pr.intersected(visible).translated(-pr.topLeft())
+            if local.isEmpty():
+                continue
+            if (item.detail is not None and abs(item.detail_zoom - rz) < 1e-6
                     and item.detail_rect.contains(local)):
                 continue
-            clip = pymupdf.Rect(local.left() / self.zoom, local.top() / self.zoom,
-                                local.right() / self.zoom, local.bottom() / self.zoom)
+            margin = 40 / self.zoom
+            local = local.adjusted(-margin, -margin, margin, margin).intersected(
+                QRectF(QPointF(0, 0), item.size))
+            clip = pymupdf.Rect(local.left(), local.top(), local.right(), local.bottom())
             pix = self.doc.page(item.page_no).get_pixmap(
-                matrix=pymupdf.Matrix(self.zoom, self.zoom), clip=clip,
-                alpha=False, annots=False)
+                matrix=pymupdf.Matrix(rz, rz), clip=clip, alpha=False, annots=False)
             item.detail = self._to_qpixmap(pix)
-            item.detail_rect = QRectF(clip.x0 * self.zoom, clip.y0 * self.zoom,
-                                      pix.width, pix.height)
-            item.detail_zoom = self.zoom
+            item.detail_rect = QRectF(clip.x0, clip.y0, pix.width / rz, pix.height / rz)
+            item.detail_zoom = rz
             item.update()
+        self._refresh_labels()
 
     def refresh_all(self):
-        cur = self.current_page()
-        self.build_scene(keep_page=cur)
+        """Pages changed (insert/delete/rotate...): rebuild, keep position."""
+        center = self.mapToScene(self.viewport().rect().center())
+        self.build_scene()
+        self.centerOn(center)
 
-    # ------------------------------------------------------------------
     def _on_scrolled(self, _val):
         self._update_visible()
+        self._update_rulers()
         self.pageChanged.emit(self.current_page())
 
     def resizeEvent(self, event):
         super().resizeEvent(event)
+        self._place_rulers()
         self._update_visible()
 
-    def _update_visible(self, render_now: bool = True):
+    def _update_visible(self):
+        if getattr(self, "_closed", False) or self.doc.doc.is_closed:
+            return
         visible = self.mapToScene(self.viewport().rect()).boundingRect()
-        if render_now:
-            buffer = visible.height() * 0.5
-            expanded = visible.adjusted(0, -buffer, 0, buffer)
-            for item in self.page_items:
-                if not item.rendered and item.page_rect().intersects(expanded):
-                    self.refresh_page(item.page_no)
+        buffer = visible.height() * 0.5
+        expanded = visible.adjusted(0, -buffer, 0, buffer)
+        for item in self.page_items:
+            if not item.rendered and item.page_rect().intersects(expanded):
+                self.refresh_page(item.page_no)
         self._schedule_detail()
 
-    # ------------------------------------------------------------------
     def _item_at_scene(self, scene_pos) -> PageItem | None:
         for item in self.page_items:
             if item.page_rect().contains(scene_pos):
@@ -455,8 +605,6 @@ class PdfGraphicsView(QGraphicsView):
 
     # -- grid / snapping ------------------------------------------------
     def grid_spacing(self) -> float:
-        """Grid step in PDF points: a round real-world length when the
-        plan scale is known, otherwise a round paper length in mm."""
         scale = self.doc.scale_points_per_meter
         if scale:
             steps = [s * scale for s in (0.01, 0.05, 0.1, 0.25, 0.5, 1, 2, 5, 10, 20, 50, 100)]
@@ -469,9 +617,8 @@ class PdfGraphicsView(QGraphicsView):
 
     def grid_description(self) -> str:
         st = self.grid_spacing()
-        scale = self.doc.scale_points_per_meter
-        if scale:
-            return f"Grille : {self.doc.format_length(st / scale)}"
+        if self.doc.scale_points_per_meter:
+            return f"Grille : {self.doc.fmt_length_pts(st)}"
         return f"Grille : {round(st * 25.4 / 72)} mm (papier)"
 
     def set_grid(self, show: bool):
@@ -481,40 +628,71 @@ class PdfGraphicsView(QGraphicsView):
     def drawForeground(self, painter, rect):
         if not self.show_grid:
             return
-        step = self.grid_spacing() * self.zoom
-        if step <= 0:
-            return
+        step = self.grid_spacing()
         minor = QPen(QColor(47, 111, 237, 50))
         minor.setCosmetic(True)
         major = QPen(QColor(47, 111, 237, 110))
         major.setCosmetic(True)
         for item in self.page_items:
-            r = item.page_rect()
-            if not r.intersects(rect):
+            r = item.page_rect().intersected(rect)
+            if r.isEmpty():
                 continue
-            nx = int(r.width() / step) + 1
-            ny = int(r.height() / step) + 1
-            for i in range(nx):
-                x = r.left() + i * step
+            pr = item.page_rect()
+            i0 = max(0, int((r.left() - pr.left()) / step))
+            i1 = int((r.right() - pr.left()) / step) + 1
+            for i in range(i0, i1 + 1):
+                x = pr.left() + i * step
                 painter.setPen(major if i % 5 == 0 else minor)
                 painter.drawLine(QPointF(x, r.top()), QPointF(x, r.bottom()))
-            for j in range(ny):
-                y = r.top() + j * step
+            j0 = max(0, int((r.top() - pr.top()) / step))
+            j1 = int((r.bottom() - pr.top()) / step) + 1
+            for j in range(j0, j1 + 1):
+                y = pr.top() + j * step
                 painter.setPen(major if j % 5 == 0 else minor)
                 painter.drawLine(QPointF(r.left(), y), QPointF(r.right(), y))
 
-    def _scene_to_pdf_point(self, item: PageItem, scene_pos: QPointF) -> pymupdf.Point:
+    # -- coordinates --------------------------------------------------------
+    def _scene_to_visual(self, item: PageItem, scene_pos: QPointF) -> pymupdf.Point:
         local = scene_pos - item.pos()
-        pt = pymupdf.Point(local.x() / self.zoom, local.y() / self.zoom)
+        pt = pymupdf.Point(local.x(), local.y())
         if self.snap_to_grid and self.tool not in (Tool.PAN, Tool.SELECT):
             st = self.grid_spacing()
             pt = pymupdf.Point(round(pt.x / st) * st, round(pt.y / st) * st)
+        return pt
+
+    def _scene_to_pdf_point(self, item: PageItem, scene_pos: QPointF) -> pymupdf.Point:
         page = self.doc.page(item.page_no)
-        return pt * page.derotation_matrix
+        return self._scene_to_visual(item, scene_pos) * page.derotation_matrix
+
+    def _pdf_to_scene(self, item: PageItem, pdf_pt) -> QPointF:
+        page = self.doc.page(item.page_no)
+        vis = pymupdf.Point(pdf_pt) * ~page.derotation_matrix
+        return item.pos() + QPointF(vis.x, vis.y)
+
+    def _constrain(self, item: PageItem, start_pdf, scene_pos: QPointF, modifiers) -> QPointF:
+        """Shift: lock the segment to 0°, 45° or 90°."""
+        if not (modifiers & Qt.ShiftModifier) or start_pdf is None:
+            return scene_pos
+        s = self._pdf_to_scene(item, start_pdf)
+        dx, dy = scene_pos.x() - s.x(), scene_pos.y() - s.y()
+        ang = math.atan2(dy, dx)
+        snapped = round(ang / (math.pi / 4)) * (math.pi / 4)
+        length = math.hypot(dx, dy) * math.cos(ang - snapped)
+        return QPointF(s.x() + length * math.cos(snapped), s.y() + length * math.sin(snapped))
 
     # ------------------------------------------------------------------
+    def _require_scale(self) -> bool:
+        if self.doc.scale_points_per_meter or self.calibrating:
+            return True
+        self.scaleRequired.emit()
+        self.statusMessage.emit(
+            "Indiquez d'abord l'échelle du plan dans la barre « Mesure » (ou « Calibrer »).")
+        return False
+
     def mousePressEvent(self, event):
         if self.tool in POLY_TOOLS:
+            if event.button() == Qt.LeftButton and not self._poly_points and not self._require_scale():
+                return
             self._handle_polygon_click(event)
             return
 
@@ -524,7 +702,7 @@ class PdfGraphicsView(QGraphicsView):
 
         scene_pos = self.mapToScene(event.pos())
         item = self._item_at_scene(scene_pos)
-        if item is None:
+        if item is None or event.button() != Qt.LeftButton:
             super().mousePressEvent(event)
             return
 
@@ -567,6 +745,8 @@ class PdfGraphicsView(QGraphicsView):
             return
 
         if self.tool in DRAG_TOOLS:
+            if self.tool == Tool.MEASURE_LINE and not self._require_scale():
+                return
             self._dragging = True
             self._drag_page = page_no
             self._drag_start_pt = pdf_pt
@@ -580,17 +760,23 @@ class PdfGraphicsView(QGraphicsView):
         if self.loupe_enabled:
             self._update_loupe(event.pos())
         if self.tool in POLY_TOOLS and self._poly_points:
-            scene_pos = self.mapToScene(event.pos())
+            item = self.page_items[self._poly_page]
+            scene_pos = self._constrain(item, self._poly_points[-1],
+                                        self.mapToScene(event.pos()), event.modifiers())
             self._update_poly_preview(extra_scene_pt=scene_pos)
             return
         if not self._dragging:
             super().mouseMoveEvent(event)
             return
-        scene_pos = self.mapToScene(event.pos())
         item = self.page_items[self._drag_page]
+        scene_pos = self.mapToScene(event.pos())
+        if self.tool in (Tool.MEASURE_LINE, Tool.LINE, Tool.ARROW):
+            scene_pos = self._constrain(item, self._drag_start_pt, scene_pos, event.modifiers())
         pdf_pt = self._scene_to_pdf_point(item, scene_pos)
         self._drag_points.append(pdf_pt)
         self._update_preview(item, pdf_pt)
+        if self.tool == Tool.MEASURE_LINE:
+            self._show_measure_info([self._drag_start_pt, pdf_pt], "line", item)
 
     def mouseReleaseEvent(self, event):
         if not self._dragging:
@@ -660,11 +846,11 @@ class PdfGraphicsView(QGraphicsView):
                 length_pts = math.hypot(end.x - start.x, end.y - start.y)
                 if length_pts < 1:
                     return
-                if not self._ensure_scale(length_pts):
+                if self.calibrating:
+                    self._calibrate_with(length_pts)
                     return
-                meters = self.doc.points_to_meters(length_pts)
-                label = self.doc.format_length(meters)
-                self.doc.add_measure_line(page_no, start, end, self.current_color, label)
+                label = self.doc.measure_label("pdfsuite:measure_line", [start, end])
+                self.doc.add_measure_line(page_no, start, end, self.measure_color, label)
 
             self._rebuild_page_annotations(item)
             self.documentModified.emit()
@@ -672,35 +858,48 @@ class PdfGraphicsView(QGraphicsView):
             self._drag_points = []
             self._drag_start_pt = None
 
-    # -- scale calibration ------------------------------------------------
-    def _ensure_scale(self, reference_length_points: float) -> bool:
-        if self.doc.scale_points_per_meter or reference_length_points <= 0:
-            return self.doc.scale_points_per_meter is not None
-        dlg = CalibrationDialog(self)
+    # -- calibration ------------------------------------------------------
+    def start_calibration(self):
+        self.calibrating = True
+        self.statusMessage.emit(
+            "Calibrage : tracez une ligne sur une cote connue du plan, puis saisissez sa longueur réelle.")
+
+    def _calibrate_with(self, length_pts: float):
+        self.calibrating = False
+        dlg = CalibrationDialog(self, default_unit=self.doc.unit)
         if dlg.exec() != QDialog.Accepted:
-            return False
+            return
         real_m = dlg.real_length_meters()
         if real_m <= 0:
-            return False
-        self.doc.scale_points_per_meter = reference_length_points / real_m
-        return True
+            return
+        self.doc.scale_points_per_meter = length_pts / real_m
+        self.doc.relabel_measurements()
+        self.rebuild_annotations()
+        self.scaleCalibrated.emit()
+        self.documentModified.emit()
 
-    # -- click-to-add-vertex perimeter tool --------------------------------
+    # -- click-to-add-vertex polygon tools ---------------------------------
     def _handle_polygon_click(self, event):
-        scene_pos = self.mapToScene(event.pos())
         if event.button() == Qt.RightButton:
             self._finish_polygon()
             event.accept()
             return
+        scene_pos = self.mapToScene(event.pos())
         item = self._item_at_scene(scene_pos)
         if item is None:
             return
         if self._poly_points and item.page_no != self._poly_page:
-            self.statusMessage.emit("Restez sur la même page pour ce périmètre.")
+            self.statusMessage.emit("Restez sur la même page pour ce tracé.")
             return
+        if self._poly_points:
+            scene_pos = self._constrain(item, self._poly_points[-1], scene_pos, event.modifiers())
+            # click back on the first point closes the shape
+            first = self.mapFromScene(self._pdf_to_scene(item, self._poly_points[0]))
+            if len(self._poly_points) >= 3 and (first - event.pos()).manhattanLength() <= 10:
+                self._finish_polygon()
+                return
         self._poly_page = item.page_no
-        pdf_pt = self._scene_to_pdf_point(item, scene_pos)
-        self._poly_points.append(pdf_pt)
+        self._poly_points.append(self._scene_to_pdf_point(item, scene_pos))
         self._update_poly_preview()
 
     def mouseDoubleClickEvent(self, event):
@@ -718,8 +917,11 @@ class PdfGraphicsView(QGraphicsView):
             if event.key() in (Qt.Key_Return, Qt.Key_Enter):
                 self._finish_polygon()
                 return
+            if event.key() == Qt.Key_Backspace and self._poly_points:
+                self._poly_points.pop()
+                self._update_poly_preview()
+                return
         if event.key() == Qt.Key_Escape and self.tool != Tool.SELECT:
-            # the tool stays active after each use; Échap goes back to Sélection
             self.requestSelectTool.emit()
             return
         super().keyPressEvent(event)
@@ -729,20 +931,28 @@ class PdfGraphicsView(QGraphicsView):
             self._scene.removeItem(self._poly_preview_item)
             self._poly_preview_item = None
         if not self._poly_points or self._poly_page < 0:
+            self._show_measure_info(None)
             return
         item = self.page_items[self._poly_page]
-        pen = QPen(QColor.fromRgbF(*self.current_color))
-        pen.setWidth(2)
-        pen.setStyle(Qt.DashLine)
+        pen = QPen(QColor.fromRgbF(*self.measure_color), 2, Qt.DashLine)
+        pen.setCosmetic(True)
         path = QPainterPath(self._pdf_to_scene(item, self._poly_points[0]))
         for pt in self._poly_points[1:]:
             path.lineTo(self._pdf_to_scene(item, pt))
+        pts = list(self._poly_points)
         if extra_scene_pt is not None:
             path.lineTo(extra_scene_pt)
+            pts.append(self._scene_to_pdf_point(item, extra_scene_pt))
+        if len(pts) >= 3:
+            path.closeSubpath()
         self._poly_preview_item = QGraphicsPathItem(path)
         self._poly_preview_item.setPen(pen)
+        fill = QColor.fromRgbF(*self.measure_color)
+        fill.setAlpha(40 if self.tool == Tool.MEASURE_AREA else 0)
+        self._poly_preview_item.setBrush(QBrush(fill))
         self._poly_preview_item.setZValue(10)
         self._scene.addItem(self._poly_preview_item)
+        self._show_measure_info(pts, "area" if self.tool == Tool.MEASURE_AREA else "perimeter", item)
 
     def _cancel_polygon(self):
         self._poly_points = []
@@ -750,6 +960,7 @@ class PdfGraphicsView(QGraphicsView):
         if self._poly_preview_item is not None:
             self._scene.removeItem(self._poly_preview_item)
             self._poly_preview_item = None
+        self._show_measure_info(None)
 
     def _finish_polygon(self):
         points = self._poly_points
@@ -757,44 +968,61 @@ class PdfGraphicsView(QGraphicsView):
         if len(points) < 3:
             self._cancel_polygon()
             return
-        first_edge = math.hypot(points[1].x - points[0].x, points[1].y - points[0].y)
-        if not self._ensure_scale(first_edge):
-            self._cancel_polygon()
-            return
-        perimeter_pts = sum(
-            math.hypot(points[(i + 1) % len(points)].x - points[i].x,
-                       points[(i + 1) % len(points)].y - points[i].y)
-            for i in range(len(points))
-        )
-        area_pts2 = abs(sum(
-            points[i].x * points[(i + 1) % len(points)].y
-            - points[(i + 1) % len(points)].x * points[i].y
-            for i in range(len(points))
-        )) / 2.0
-        meters = self.doc.points_to_meters(perimeter_pts)
-        scale = self.doc.scale_points_per_meter
-        area_m2 = area_pts2 / (scale * scale) if scale else 0.0
-        if self.tool == Tool.MEASURE_AREA:
-            label = f"Surface {self.doc.format_area(area_m2)}"
-            subject = "pdfsuite:measure_area"
-        else:
-            label = f"Périmètre {self.doc.format_length(meters)} · Surface {self.doc.format_area(area_m2)}"
-            subject = "pdfsuite:measure_perimeter"
-        self.doc.add_measure_polygon(page_no, points, self.current_color, label, subject)
+        subject = "pdfsuite:measure_area" if self.tool == Tool.MEASURE_AREA else "pdfsuite:measure_perimeter"
+        label = self.doc.measure_label(subject, points)
+        self.doc.add_measure_polygon(page_no, points, self.measure_color, label, subject)
         self._cancel_polygon()
         self._rebuild_page_annotations(self.page_items[page_no])
         self.documentModified.emit()
 
-    # -- live preview while dragging ------------------------------------
-    def _pdf_to_scene(self, item: PageItem, pdf_pt) -> QPointF:
-        page = self.doc.page(item.page_no)
-        vis = pdf_pt * ~page.derotation_matrix
-        return item.pos() + QPointF(vis.x * self.zoom, vis.y * self.zoom)
+    # -- live measurement panel -------------------------------------------
+    def _show_measure_info(self, pdf_pts, kind: str = "line", item: PageItem | None = None):
+        box = self._measure_info
+        if not pdf_pts or len(pdf_pts) < 2 or self.tool not in MEASURE_TOOLS:
+            box.hide()
+            return
+        doc = self.doc
+        page = doc.page(item.page_no) if item else None
+        vis = [pymupdf.Point(p) * ~page.derotation_matrix for p in pdf_pts] if page else pdf_pts
+        rows = []
+        if kind == "line" or self.calibrating:
+            a, b = vis[0], vis[-1]
+            dx, dy = b.x - a.x, b.y - a.y
+            angle = math.degrees(math.atan2(-dy, dx)) % 360
+            title = "Calibrage" if self.calibrating else "Longueur"
+            rows += [("Distance", doc.fmt_length_pts(math.hypot(dx, dy)) if not self.calibrating
+                      else f"{math.hypot(dx, dy) * 25.4 / 72:.1f} mm papier"),
+                     ("Angle", f"{angle:.1f}°".replace(".", ",")),
+                     ("ΔX", doc.fmt_length_pts(abs(dx))),
+                     ("ΔY", doc.fmt_length_pts(abs(dy)))]
+        else:
+            tup = [(p.x, p.y) for p in vis]
+            title = "Surface" if kind == "area" else "Périmètre"
+            last = math.dist(tup[-2], tup[-1])
+            rows += [("Surface", doc.fmt_area_pts2(doc.poly_area(tup))),
+                     ("Périmètre", doc.fmt_length_pts(doc.poly_perimeter(tup))),
+                     ("Dernier côté", doc.fmt_length_pts(last)),
+                     ("Points", str(len(tup)))]
+        ratio = doc.ratio()
+        rows += [("Échelle", f"1:{ratio:g}".replace(".", ",") if ratio else "non définie"),
+                 ("Précision", f"{10 ** -doc.decimals:g}".replace(".", ","))]
+        html = (f"<b style='color:#2f6fed'>{title}</b><table cellspacing=0 cellpadding=1>"
+                + "".join(f"<tr><td align=right style='color:#555'>{k} :&nbsp;</td>"
+                          f"<td><b>{v}</b></td></tr>" for k, v in rows)
+                + "</table>")
+        box.setText(html)
+        box.adjustSize()
+        vp = self.viewport()
+        box.move(vp.width() - box.width() - 12, 12)
+        box.show()
+        box.raise_()
 
+    # -- live preview while dragging ------------------------------------
     def _update_preview(self, item: PageItem, _cur_pt):
         self._clear_preview()
-        pen = QPen(QColor.fromRgbF(*self.current_color))
-        pen.setWidth(2)
+        color = self.measure_color if self.tool == Tool.MEASURE_LINE else self.current_color
+        pen = QPen(QColor.fromRgbF(*color), 2)
+        pen.setCosmetic(True)
         p0 = self._pdf_to_scene(item, self._drag_start_pt)
         if self.tool == Tool.INK:
             path = QPainterPath(p0)
@@ -815,6 +1043,7 @@ class PdfGraphicsView(QGraphicsView):
                 self._preview_item = QGraphicsRectItem(r)
             if self.tool == Tool.CAPTURE:
                 pen = QPen(QColor(47, 111, 237), 1.5, Qt.DashLine)
+                pen.setCosmetic(True)
             self._preview_item.setPen(pen)
         self._preview_item.setZValue(10)
         self._scene.addItem(self._preview_item)
@@ -823,6 +1052,8 @@ class PdfGraphicsView(QGraphicsView):
         if self._preview_item is not None:
             self._scene.removeItem(self._preview_item)
             self._preview_item = None
+        if not self._poly_points:
+            self._measure_info.hide()
 
     # -- text block editing ----------------------------------------------
     def _start_text_edit(self, page_no: int, pdf_pt):
@@ -850,11 +1081,11 @@ class PdfGraphicsView(QGraphicsView):
         self.documentModified.emit()
 
     def place_signature_image(self, page_no: int, pdf_pt, png_bytes: bytes,
-                               width_pt: float = 140.0):
+                              width_pt: float = 140.0):
         page = self.doc.page(page_no)
         aspect = 0.4
         rect = pymupdf.Rect(pdf_pt.x, pdf_pt.y,
-                             pdf_pt.x + width_pt, pdf_pt.y + width_pt * aspect)
+                            pdf_pt.x + width_pt, pdf_pt.y + width_pt * aspect)
         page.insert_image(rect, stream=png_bytes, keep_proportion=True)
         self.doc.mark_dirty()
         self.refresh_page(page_no)
@@ -862,21 +1093,31 @@ class PdfGraphicsView(QGraphicsView):
 
     # -- cursor coordinates -----------------------------------------------
     def _emit_cursor_info(self, viewport_pos):
+        if self.rulers_visible:
+            self._hruler.cursor_px = viewport_pos.x()
+            self._vruler.cursor_px = viewport_pos.y()
+            self._update_rulers()
         scene_pos = self.mapToScene(viewport_pos)
         item = self._item_at_scene(scene_pos)
         if item is None:
             self.cursorInfo.emit("")
             return
         local = scene_pos - item.pos()
-        x_pt, y_pt = local.x() / self.zoom, local.y() / self.zoom
-        scale = self.doc.scale_points_per_meter
-        if scale:
-            self.cursorInfo.emit(f"x {x_pt / scale:.2f} m · y {y_pt / scale:.2f} m")
-        else:
-            self.cursorInfo.emit(f"x {x_pt * 25.4 / 72:.0f} mm · y {y_pt * 25.4 / 72:.0f} mm")
+        upp, unit = self.units_per_point()
+        x, y = local.x() * upp, local.y() * upp
+        d = max(self.doc.decimals, 1) if unit != "cm" or self.doc.scale_points_per_meter else 1
+        self.cursorInfo.emit(f"X : {x:.{d}f} {unit}   Y : {y:.{d}f} {unit}".replace(".", ","))
+
+    def page_size_text(self) -> str:
+        if not self.page_items:
+            return ""
+        it = self.page_items[self.current_page()]
+        upp, unit = self.units_per_point()
+        w, h = it.size.width() * upp, it.size.height() * upp
+        return f"L : {w:.2f} {unit}   H : {h:.2f} {unit}".replace(".", ",")
 
     # -- magnifier --------------------------------------------------------
-    LOUPE_SRC = 70       # half-size of the source square, in screen pixels
+    LOUPE_SRC = 70
     LOUPE_FACTOR = 2.5
 
     def set_loupe(self, enabled: bool):
@@ -901,21 +1142,26 @@ class PdfGraphicsView(QGraphicsView):
     def leaveEvent(self, event):
         if self._loupe is not None:
             self._loupe.hide()
+        self._hruler.cursor_px = self._vruler.cursor_px = None
+        self._update_rulers()
         self.cursorInfo.emit("")
         super().leaveEvent(event)
 
-    # -- invert colours (dark plan reading) ----------------------------------
+    # -- invert colours ------------------------------------------------------
     def set_invert(self, enabled: bool):
         self.invert_colors = enabled
-        self.refresh_all()          # never reuses images: all re-rendered
+        for item in self.page_items:
+            item.base = None
+            item.detail = None
+            item.update()
+        self._update_visible()
 
     # -- capture a zone to the clipboard -------------------------------------
-    def capture_to_clipboard(self, item: PageItem, p1, p2, factor: float = 2.0) -> QImage:
-        """Copies exactly what is displayed (page + annotations + measure
-        labels) inside the dragged rectangle, at ``factor`` x resolution."""
+    def capture_to_clipboard(self, item: PageItem, p1, p2, factor: float | None = None) -> QImage:
         a = self._pdf_to_scene(item, p1)
         b = self._pdf_to_scene(item, p2)
         src = QRectF(a, b).normalized()
+        factor = factor or max(2.0, self.zoom * 2)
         img = QImage(QSize(max(1, int(src.width() * factor)), max(1, int(src.height() * factor))),
                      QImage.Format_ARGB32)
         img.fill(QColor(255, 255, 255))
@@ -964,8 +1210,3 @@ class PdfGraphicsView(QGraphicsView):
         x0 = end.x if end.x >= target.x else end.x - w
         box = pymupdf.Rect(x0, end.y - h / 2, x0 + w, end.y + h / 2)
         self.doc.add_callout(page_no, target, box, text, self.current_color, size)
-
-    # -- keep other views of the same document in sync -------------------------
-    def rebuild_annotations(self):
-        for item in self.page_items:
-            self._rebuild_page_annotations(item)

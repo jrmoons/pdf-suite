@@ -1,3 +1,5 @@
+import os as _os; _os.environ["PDFSUITE_SETTINGS"] = "PDFSuiteTests"
+from PySide6.QtCore import QSettings as _QS; _QS("PDFSuite", "PDFSuiteTests").clear()  # fresh test settings
 import sys, os
 sys.path.insert(0, os.path.abspath("."))
 import pymupdf

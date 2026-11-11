@@ -10,12 +10,18 @@
 - Piège PyMuPDF : un seul objet `Page` par index (`PdfDocument._page_cache`). Ne jamais
   refaire des `doc[i]` répétés, sinon erreur « annotation not bound to any page ».
 - Annotations = items vectoriels Qt (`annotation_items.py`), page rendue avec `annots=False`.
-- Perf (2026-11-11) : `PageItem` n'est PAS rendu au zoom complet. Image de base plafonnée
-  (`BASE_MAX_PX`) étirée à la taille de la page + tuile nette de la zone visible au zoom exact
-  (`_render_pending`, différé `DETAIL_DELAY_MS`). Ctrl+molette = transformation de vue
-  instantanée puis `set_zoom` différé. Vignettes rendues une par une (QTimer).
-  Ne jamais revenir à un rendu pleine page au zoom (plans A0/A1 = centaines de Mo, secondes).
+- Perf / zoom (2026-11-11) : **scène en points PDF** (`scene_scale` = 1), le zoom n'est
+  qu'une transformation de vue (`set_zoom`), jamais de reconstruction de scène. `PageItem` =
+  image de base plafonnée (`BASE_MAX_PX`) + tuile nette de la zone visible au zoom écran
+  (`_render_pending`, différé). Poignées en `ItemIgnoresTransformations`, cotes de taille
+  écran constante (`zoom_changed`). Ne jamais revenir à un rendu pleine page au zoom.
   Plan lourd de test : `.smoke/make_heavy.py`.
+- Mesures : tout libellé passe par `PdfDocument.measure_label` (unité `PDFSuiteUnit`,
+  précision `PDFSuiteDecimals`, échelle `PDFSuiteScale`, surfaces toujours en m²).
+  Barre de propriétés = `measure_bar.py`. Pas de mesure sans échelle (`scaleRequired`).
+- Tests : chaque `.smoke/run_smoke*.py` utilise des réglages séparés
+  (`PDFSUITE_SETTINGS=PDFSuiteTests`, `settings.py`) — ne jamais écrire dans les réglages
+  réels de Jérémy.
 - Exe local = version dossier `dist\PDFSuite\PDFSuite.exe` (démarrage rapide, raccourci Bureau) ;
   GitHub Actions produit toujours un exe fichier unique (portable).
 - Règle : ne citer aucun logiciel PDF tiers comme source ou inspiration (code, README, commits).

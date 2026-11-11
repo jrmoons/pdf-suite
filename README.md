@@ -32,9 +32,10 @@ n'est jamais écrasé (nom proposé : `…_modifié.pdf`).
 
 ## Fonctionnalités
 
-- **Visionneuse** : multi-onglets, défilement continu, zoom instantané
-  (Ctrl + molette centré sur le curseur) même sur de gros plans A0/A1 — seule
-  la zone visible est recalculée en haute définition, vignettes réorganisables, thème clair / sombre.
+- **Visionneuse** : multi-onglets, défilement continu, **zoom instantané**
+  (Ctrl + molette sous le curseur, boutons, curseur et liste de zoom dans la
+  barre d'état, Ctrl+0 / Ctrl+1 / Ctrl+2) même sur de gros plans A0/A1 —
+  seule la zone visible est recalculée en haute définition, vignettes réorganisables, thème clair / sombre.
 - **Commentaires** : surligner, souligner, barrer, texte libre, note, dessin,
   rectangle, ellipse, ligne, **flèche**, **nuage de révision**, **légende**
   (texte + trait vers le point visé, pointe déplaçable), **tampons de chantier**
@@ -44,13 +45,20 @@ n'est jamais écrasé (nom proposé : `…_modifié.pdf`).
   déplaçables (clic droit → Verrouiller / Supprimer).
 - **Mesures (plans)** :
   - Longueur, Périmètre, **Surface (m²)** ;
-  - **Échelle** : préréglages 1:20, 1:50, 1:100, 1:200… ou calibrage sur une
-    ligne de longueur connue ; l'échelle est **enregistrée dans le PDF** et
-    retrouvée à la réouverture ;
-  - **Grille** (pas en mètres quand l'échelle est connue) + **Aimanter** ;
-    coordonnées du curseur en bas à droite ;
-  - **Exporter mesures** : toutes les mesures vers un CSV qui s'ouvre dans
-    Excel (totaux inclus) ;
+  - **Barre « Mesure »** sous le ruban (visible avec un outil de mesure ou
+    l'onglet Mesures) : échelle « 1 cm sur le plan = 0,5 m en réel »,
+    préréglages 1:50, 1:100…, unité des longueurs (mm / cm / m), précision,
+    couleur, **Calibrer** (tracer une cote connue). Tout est **enregistré dans
+    le PDF** ; tant que l'échelle n'est pas saisie, la barre la réclame ;
+  - pendant le tracé, panneau en direct : distance, angle, ΔX, ΔY, échelle,
+    précision ; **Maj** bloque à 0° / 45° / 90° ; pour un contour, recliquer
+    sur le premier point (ou clic droit / Entrée) ferme la forme,
+    Retour arrière enlève le dernier point ;
+  - cotes lisibles à tous les zooms ; surfaces toujours en m² ;
+  - **Règles** graduées en unités réelles + taille de page et position X / Y
+    du curseur dans la barre d'état ;
+  - **Grille** + **Aimanter** ;
+  - **Exporter mesures** : CSV pour Excel (totaux inclus) ;
   - **Comparer** deux versions d'un plan : rouge = supprimé, vert = ajouté
     (les deux plans doivent avoir la même mise en page) ;
   - **Capture** : copie une zone (avec les cotes) dans le presse-papiers.

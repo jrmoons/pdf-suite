@@ -74,6 +74,7 @@ class VertexHandle(QGraphicsEllipseItem):
         self.setCursor(Qt.CrossCursor)
         self.setFlag(QGraphicsItem.ItemIsMovable, True)
         self.setFlag(QGraphicsItem.ItemSendsGeometryChanges, True)
+        self.setFlag(QGraphicsItem.ItemIgnoresTransformations, True)
 
     def set_locked(self, locked: bool):
         self.setFlag(QGraphicsItem.ItemIsMovable, not locked)
@@ -107,7 +108,7 @@ class ShapeItem(QGraphicsObject):
         self.width = width
         self.locked = False
 
-        self.setScale(view.zoom)
+        self.setScale(view.scene_scale)
         self.setZValue(self.KIND_ZVALUE)
         self.setFlag(QGraphicsItem.ItemIsSelectable, True)
         self.setFlag(QGraphicsItem.ItemIsMovable, True)
@@ -289,7 +290,7 @@ class MarkupItem(QGraphicsObject):
         self.kind = kind
         self.quads = quads  # list[QRectF] in visual points
         self.color_tuple = color
-        self.setScale(view.zoom)
+        self.setScale(view.scene_scale)
         self.setZValue(3)
         self.setFlag(QGraphicsItem.ItemIsSelectable, True)
 
@@ -336,7 +337,7 @@ class NoteItem(QGraphicsObject):
         self.annot = annot
         self.point = point
         self.content = content
-        self.setScale(view.zoom)
+        self.setScale(view.scene_scale)
         self.setZValue(9)
         self.setFlag(QGraphicsItem.ItemIsSelectable, True)
         self.setToolTip(content)
@@ -376,7 +377,7 @@ class FreeTextItem(QGraphicsObject):
         self.rect = rect
         self.text = text
         self.color_tuple = color
-        self.setScale(view.zoom)
+        self.setScale(view.scene_scale)
         self.setZValue(9)
         self.setFlag(QGraphicsItem.ItemIsSelectable, True)
 
@@ -402,9 +403,12 @@ class FreeTextItem(QGraphicsObject):
 
 
 class MeasureItemBase(QGraphicsObject):
-    """Shared behaviour for line/perimeter measurement items: a body plus
-    draggable vertex handles, so the shape can be "recadré" (nudged into
-    place) after being drawn."""
+    """Line / perimeter / area measurement: body + draggable vertex handles
+    (to adjust the shape after drawing). Lines are cosmetic (constant
+    on-screen width) and the label keeps a constant on-screen size."""
+
+    subject = "pdfsuite:measure_line"
+    LABEL_PX = 12          # label font size on screen, whatever the zoom
 
     def __init__(self, view, page_no: int, annot, points: list[QPointF], color, label: str):
         super().__init__()
@@ -417,18 +421,64 @@ class MeasureItemBase(QGraphicsObject):
         self.label = label
         self.locked = False
         self.handles: list[VertexHandle] = []
-        self.setScale(view.zoom)
         self.setZValue(9)
         self.setFlag(QGraphicsItem.ItemIsSelectable, True)
         self.setFlag(QGraphicsItem.ItemIsMovable, True)
         self.setCursor(Qt.SizeAllCursor)
 
+    # -- label geometry (in scene units, depends on the view zoom) ---------
+    def _k(self) -> float:
+        return 1.0 / max(self.view.zoom, 1e-6)
+
+    def _font(self) -> QFont:
+        f = QFont()
+        f.setPixelSize(self.LABEL_PX)
+        f.setBold(True)
+        return f
+
+    def _label_anchor(self) -> QPointF:
+        raise NotImplementedError
+
+    def _label_rect(self) -> QRectF:
+        fm = QFontMetricsF(self._font())
+        k = self._k()
+        w = (fm.horizontalAdvance(self.label) + 10) * k
+        h = (fm.height() + 4) * k
+        c = self._label_anchor()
+        return QRectF(c.x() - w / 2, c.y() - h / 2, w, h)
+
+    def _draw_label(self, painter):
+        r = self._label_rect()
+        k = self._k()
+        painter.save()
+        painter.setPen(QPen(self.color, 0))
+        painter.setBrush(QBrush(QColor(255, 255, 255, 235)))
+        painter.drawRoundedRect(r, 3 * k, 3 * k)
+        painter.translate(r.topLeft())
+        painter.scale(k, k)
+        painter.setFont(self._font())
+        painter.setPen(QPen(self.color))
+        painter.drawText(QRectF(0, 0, r.width() / k, r.height() / k), Qt.AlignCenter, self.label)
+        painter.restore()
+
+    def _pen(self) -> QPen:
+        pen = QPen(self.color, 2, Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin)
+        pen.setCosmetic(True)
+        return pen
+
+    def zoom_changed(self):
+        self.prepareGeometryChange()
+        self.update()
+
+    def _compute_label(self) -> str:
+        return self.view.doc.measure_label(self.subject, [(p.x(), p.y()) for p in self.points])
+
+    # -- handles --------------------------------------------------------
     def make_handles(self, page_item) -> list[VertexHandle]:
-        zoom = self.view.zoom
         self.handles = []
         for i, pt in enumerate(self.points):
             h = VertexHandle(self, i, parent=page_item)
-            h.setPos(pt.x() * zoom, pt.y() * zoom)
+            h.setPos(pt)
             self.handles.append(h)
         return self.handles
 
@@ -439,10 +489,9 @@ class MeasureItemBase(QGraphicsObject):
             h.set_locked(locked)
         self.update()
 
-    def handle_moving(self, index: int, new_pixel_pos: QPointF):
-        zoom = self.view.zoom or 1.0
-        self.points[index] = QPointF(new_pixel_pos.x() / zoom, new_pixel_pos.y() / zoom)
+    def handle_moving(self, index: int, new_pos: QPointF):
         self.prepareGeometryChange()
+        self.points[index] = QPointF(new_pos)
         self.label = self._compute_label()
         self.update()
 
@@ -456,13 +505,11 @@ class MeasureItemBase(QGraphicsObject):
         delta = self.pos()
         if abs(delta.x()) < 0.01 and abs(delta.y()) < 0.01:
             return
-        zoom = self.scale() or 1.0
-        pt_delta = QPointF(delta.x() / zoom, delta.y() / zoom)
-        self.points = [p + pt_delta for p in self.points]
+        self.prepareGeometryChange()
+        self.points = [p + delta for p in self.points]
         self.setPos(0, 0)
         for h, p in zip(self.handles, self.points):
-            h.setPos(p.x() * self.view.zoom, p.y() * self.view.zoom)
-        self.prepareGeometryChange()
+            h.setPos(p)
         self._sync_to_pdf()
         self.update()
 
@@ -482,51 +529,41 @@ class MeasureItemBase(QGraphicsObject):
         menu.exec(event.screenPos())
         event.accept()
 
-    def _compute_label(self) -> str:
-        raise NotImplementedError
-
     def _sync_to_pdf(self):
         raise NotImplementedError
 
 
 class MeasureLineItem(MeasureItemBase):
-    def _compute_label(self) -> str:
+    subject = "pdfsuite:measure_line"
+
+    def _label_anchor(self) -> QPointF:
         p1, p2 = self.points
-        length_pts = math.hypot(p2.x() - p1.x(), p2.y() - p1.y())
-        meters = self.view.doc.points_to_meters(length_pts)
-        return self.view.doc.format_length(meters) if meters is not None else "?"
+        mid = QPointF((p1.x() + p2.x()) / 2, (p1.y() + p2.y()) / 2)
+        dx, dy = p2.x() - p1.x(), p2.y() - p1.y()
+        length = math.hypot(dx, dy) or 1
+        nx, ny = dy / length, -dx / length          # perpendicular, "above"
+        if ny > 0:
+            nx, ny = -nx, -ny
+        off = 13 * self._k()
+        return QPointF(mid.x() + nx * off, mid.y() + ny * off)
 
     def boundingRect(self) -> QRectF:
         p1, p2 = self.points
-        r = QRectF(p1, p2).normalized().adjusted(-6, -6, 6, 6)
-        r.setHeight(r.height() + 20)
-        return r
+        pad = 8 * self._k()
+        return QRectF(p1, p2).normalized().adjusted(-pad, -pad, pad, pad).united(
+            self._label_rect().adjusted(-2, -2, 2, 2))
 
     def paint(self, painter, option, widget=None):
         p1, p2 = self.points
-        pen = QPen(self.color, 1.4, Qt.SolidLine, Qt.RoundCap)
-        painter.setPen(pen)
+        painter.setPen(self._pen())
         painter.drawLine(p1, p2)
         dx, dy = p2.x() - p1.x(), p2.y() - p1.y()
         length = math.hypot(dx, dy) or 1
-        nx, ny = -dy / length * 5, dx / length * 5
+        t = 6 * self._k()
+        nx, ny = -dy / length * t, dx / length * t
         for pt in (p1, p2):
             painter.drawLine(QPointF(pt.x() - nx, pt.y() - ny), QPointF(pt.x() + nx, pt.y() + ny))
-        mid = QPointF((p1.x() + p2.x()) / 2, (p1.y() + p2.y()) / 2)
-        self._draw_label(painter, mid)
-
-    def _draw_label(self, painter, pos: QPointF):
-        font = QFont()
-        font.setPointSizeF(9)
-        fm = QFontMetricsF(font)
-        text_rect = fm.boundingRect(self.label).adjusted(-3, -2, 3, 2)
-        text_rect.moveCenter(QPointF(pos.x(), pos.y() - 8))
-        painter.setPen(Qt.NoPen)
-        painter.setBrush(QBrush(QColor(255, 255, 255, 220)))
-        painter.drawRoundedRect(text_rect, 2, 2)
-        painter.setPen(QPen(self.color))
-        painter.setFont(font)
-        painter.drawText(text_rect, Qt.AlignCenter, self.label)
+        self._draw_label(painter)
 
     def _sync_to_pdf(self):
         page = self.view.doc.page(self.page_no)
@@ -545,56 +582,30 @@ class MeasurePolygonItem(MeasureItemBase):
     def is_area(self) -> bool:
         return self.subject.endswith("area")
 
-    def _compute_label(self) -> str:
-        perimeter_pts = _polygon_perimeter(self.points)
-        area_pts2 = _polygon_area(self.points)
-        doc = self.view.doc
-        meters = doc.points_to_meters(perimeter_pts)
-        if meters is None:
-            return "?"
-        scale = doc.scale_points_per_meter
-        area_m2 = area_pts2 / (scale * scale) if scale else 0.0
-        if self.is_area:
-            return f"Surface {doc.format_area(area_m2)}"
-        return f"Périmètre {doc.format_length(meters)} · Surface {doc.format_area(area_m2)}"
+    def _label_anchor(self) -> QPointF:
+        n = len(self.points)
+        return QPointF(sum(p.x() for p in self.points) / n, sum(p.y() for p in self.points) / n)
 
     def boundingRect(self) -> QRectF:
         if not self.points:
             return QRectF()
         xs = [p.x() for p in self.points]
         ys = [p.y() for p in self.points]
-        r = QRectF(min(xs), min(ys), max(xs) - min(xs), max(ys) - min(ys))
-        r = r.adjusted(-6, -6, 6, 6)
-        r.setHeight(r.height() + 24)
-        return r
+        pad = 4 * self._k()
+        r = QRectF(min(xs), min(ys), max(xs) - min(xs), max(ys) - min(ys)).adjusted(-pad, -pad, pad, pad)
+        return r.united(self._label_rect().adjusted(-2, -2, 2, 2))
 
     def paint(self, painter, option, widget=None):
-        pen = QPen(self.color, 1.4, Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin)
-        painter.setPen(pen)
+        painter.setPen(self._pen())
         fill = QColor(self.color)
-        fill.setAlphaF(0.30 if self.is_area else 0.12)
+        fill.setAlphaF(0.28 if self.is_area else 0.10)
         painter.setBrush(QBrush(fill))
         path = QPainterPath(self.points[0])
         for pt in self.points[1:]:
             path.lineTo(pt)
         path.closeSubpath()
         painter.drawPath(path)
-        cx = sum(p.x() for p in self.points) / len(self.points)
-        cy = sum(p.y() for p in self.points) / len(self.points)
-        self._draw_label(painter, QPointF(cx, cy))
-
-    def _draw_label(self, painter, pos: QPointF):
-        font = QFont()
-        font.setPointSizeF(9)
-        fm = QFontMetricsF(font)
-        text_rect = fm.boundingRect(self.label).adjusted(-4, -2, 4, 2)
-        text_rect.moveCenter(pos)
-        painter.setPen(Qt.NoPen)
-        painter.setBrush(QBrush(QColor(255, 255, 255, 220)))
-        painter.drawRoundedRect(text_rect, 3, 3)
-        painter.setPen(QPen(self.color))
-        painter.setFont(font)
-        painter.drawText(text_rect, Qt.AlignCenter, self.label)
+        self._draw_label(painter)
 
     def _sync_to_pdf(self):
         page = self.view.doc.page(self.page_no)
@@ -637,7 +648,7 @@ class _MovableTextBase(QGraphicsObject):
         self.text = text
         self.fontsize = fontsize
         self.locked = False
-        self.setScale(view.zoom)
+        self.setScale(view.scene_scale)
         self.setZValue(9)
         self.setFlag(QGraphicsItem.ItemIsSelectable, True)
         self.setFlag(QGraphicsItem.ItemIsMovable, True)
@@ -724,12 +735,12 @@ class CalloutItem(_MovableTextBase):
     # -- VertexHandle protocol (owner.color / handle_moving / handle_released)
     def make_handles(self, page_item):
         h = VertexHandle(self, 0, parent=page_item)
-        h.setPos(self.target.x() * self.view.zoom, self.target.y() * self.view.zoom)
+        h.setPos(self.target.x() * self.view.scene_scale, self.target.y() * self.view.scene_scale)
         self.handles = [h]
         return self.handles
 
     def handle_moving(self, index, new_pixel_pos: QPointF):
-        zoom = self.view.zoom or 1.0
+        zoom = self.view.scene_scale or 1.0
         self.prepareGeometryChange()
         self.target = QPointF(new_pixel_pos.x() / zoom, new_pixel_pos.y() / zoom)
         self.update()
@@ -766,7 +777,7 @@ class CalloutItem(_MovableTextBase):
         self.box = QRectF(self.box).translated(d)
         self.target = self.target + d
         for h in self.handles:
-            h.setPos(self.target.x() * self.view.zoom, self.target.y() * self.view.zoom)
+            h.setPos(self.target.x() * self.view.scene_scale, self.target.y() * self.view.scene_scale)
 
     def _sync_to_pdf(self):
         page = self.view.doc.page(self.page_no)
@@ -839,8 +850,7 @@ def build_item_for_annot(view, page, page_no: int, annot):
         if subject == "pdfsuite:measure_line":
             label = (annot.info or {}).get("content", "")
             item = MeasureLineItem(view, page_no, annot, [p1, p2], color, label)
-            if doc.scale_points_per_meter:
-                item.label = item._compute_label()
+            item.label = item._compute_label()
             return [item]
         if subject == "pdfsuite:arrow":
             return [ShapeItem(view, page_no, annot, "arrow", (p1, p2), color, None,
@@ -865,8 +875,7 @@ def build_item_for_annot(view, page, page_no: int, annot):
         label = (annot.info or {}).get("content", "")
         item = MeasurePolygonItem(view, page_no, annot, points, color, label)
         item.subject = subject
-        if doc.scale_points_per_meter:
-            item.label = item._compute_label()
+        item.label = item._compute_label()
         return [item]
 
     if kind == "FreeText" and subject in ("pdfsuite:stamp", "pdfsuite:callout"):
@@ -915,7 +924,7 @@ class WidgetDisplayItem(QGraphicsObject):
         self.rect = rect
         self.text = text
         self.kind = kind
-        self.setScale(view.zoom)
+        self.setScale(view.scene_scale)
         self.setZValue(4)
 
     def boundingRect(self) -> QRectF:

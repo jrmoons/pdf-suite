@@ -12,6 +12,8 @@ import pymupdf
 
 SCALE_KEY = "PDFSuiteScale"   # custom catalog key: plan scale (points per metre)
 GEOM_KEY = "PDFSuiteGeom"     # custom annot key: our own exact geometry
+UNIT_KEY = "PDFSuiteUnit"     # custom catalog key: measurement unit (mm/cm/m)
+DECIMALS_KEY = "PDFSuiteDecimals"
 
 # 1 metre of paper expressed in PDF points (72 pt per inch).
 POINTS_PER_PAPER_METER = 72 / 0.0254
@@ -87,6 +89,123 @@ class PdfDocument:
         if abs(ratio - round(ratio)) < 0.05:
             return f"Échelle 1:{round(ratio)}"
         return f"Échelle 1:{ratio:.1f}"
+
+    # -- measurement unit / formatting (single source of truth) ------------
+    UNITS = {"mm": 0.001, "cm": 0.01, "m": 1.0}
+
+    def _read_key(self, key: str):
+        try:
+            return self.doc.xref_get_key(self.doc.pdf_catalog(), key)
+        except Exception:
+            return ("null", "null")
+
+    @property
+    def unit(self) -> str:
+        if not hasattr(self, "_unit"):
+            kind, val = self._read_key(UNIT_KEY)
+            self._unit = val.strip("()/") if kind in ("string", "name") and val.strip("()/") in self.UNITS else None
+        return self._unit or "m"
+
+    @property
+    def unit_from_file(self) -> bool:
+        _ = self.unit
+        return self._unit is not None
+
+    @unit.setter
+    def unit(self, value: str):
+        if value not in self.UNITS:
+            return
+        self._unit = value
+        try:
+            self.doc.xref_set_key(self.doc.pdf_catalog(), UNIT_KEY, f"/{value}")
+        except Exception:
+            pass
+        self.mark_dirty()
+
+    @property
+    def decimals(self) -> int:
+        if not hasattr(self, "_decimals"):
+            kind, val = self._read_key(DECIMALS_KEY)
+            self._decimals = int(val) if kind == "int" else None
+        return 2 if self._decimals is None else self._decimals
+
+    @decimals.setter
+    def decimals(self, value: int):
+        self._decimals = max(0, min(4, int(value)))
+        try:
+            self.doc.xref_set_key(self.doc.pdf_catalog(), DECIMALS_KEY, str(self._decimals))
+        except Exception:
+            pass
+        self.mark_dirty()
+
+    def _num(self, value: float) -> str:
+        return f"{value:.{self.decimals}f}".replace(".", ",")
+
+    def fmt_length_pts(self, points: float) -> str:
+        """PDF points -> '3,25 m' in the document unit ('?' without scale)."""
+        m = self.points_to_meters(points)
+        if m is None:
+            return "?"
+        return f"{self._num(m / self.UNITS[self.unit])} {self.unit}"
+
+    def fmt_area_pts2(self, points2: float) -> str:
+        """Surfaces are always given in m² (plan convention), lengths in
+        the chosen unit."""
+        s = self.scale_points_per_meter
+        if not s:
+            return "?"
+        return f"{self._num(points2 / (s * s))} m²"
+
+    @staticmethod
+    def poly_perimeter(pts, closed: bool = True) -> float:
+        import math
+        n = len(pts)
+        segs = range(n) if closed else range(n - 1)
+        return sum(math.dist(pts[i], pts[(i + 1) % n]) for i in segs)
+
+    @staticmethod
+    def poly_area(pts) -> float:
+        n = len(pts)
+        return abs(sum(pts[i][0] * pts[(i + 1) % n][1] - pts[(i + 1) % n][0] * pts[i][1]
+                       for i in range(n))) / 2.0
+
+    def measure_label(self, subject: str, pts) -> str:
+        """Label of a measurement from its vertices [(x, y), ...]."""
+        pts = [(float(p[0]), float(p[1])) for p in pts]
+        if subject.endswith("line"):
+            return self.fmt_length_pts(self.poly_perimeter(pts, closed=False))
+        area = self.fmt_area_pts2(self.poly_area(pts))
+        if subject.endswith("area"):
+            return f"S = {area}"
+        return f"P = {self.fmt_length_pts(self.poly_perimeter(pts))} · S = {area}"
+
+    def relabel_measurements(self):
+        """Rewrites the stored label of every measurement (after a change
+        of scale / unit / decimals) so other PDF readers show the same."""
+        for i in range(self.page_count):
+            for annot in self.annotations(i):
+                subject = (annot.info or {}).get("subject", "")
+                if subject.startswith("pdfsuite:measure_") and annot.vertices:
+                    annot.set_info(content=self.measure_label(subject, annot.vertices))
+                    annot.update()
+        self.mark_dirty()
+
+    def set_paper_real_scale(self, paper: float, paper_unit: str, real: float, real_unit: str):
+        """'paper' length on the sheet represents 'real' length on site,
+        e.g. 1 cm = 0,5 m  (-> 1:50)."""
+        paper_m = paper * self.UNITS[paper_unit]
+        real_m = real * self.UNITS[real_unit]
+        if paper_m > 0 and real_m > 0:
+            self.scale_points_per_meter = paper_m * POINTS_PER_PAPER_METER / real_m
+
+    def ratio(self) -> float | None:
+        s = self.scale_points_per_meter
+        return POINTS_PER_PAPER_METER / s if s else None
+
+    def to_unit(self, points: float) -> float | None:
+        """PDF points -> value in the document unit (None without scale)."""
+        m = self.points_to_meters(points)
+        return None if m is None else m / self.UNITS[self.unit]
 
     def points_to_meters(self, points: float) -> float | None:
         if not self.scale_points_per_meter:
@@ -447,35 +566,31 @@ class PdfDocument:
 
     # -- measurement report ----------------------------------------------
     def measurements(self) -> list[dict]:
-        """Every PDF Suite measurement of the document, with values
-        recomputed from the geometry using the current scale."""
-        import math
+        """Every PDF Suite measurement of the document, values recomputed
+        from the geometry with the current scale, in the document unit."""
         rows = []
         scale = self.scale_points_per_meter
+        u = self.UNITS[self.unit]
         for i in range(self.page_count):
             for annot in self.annotations(i):
                 subject = (annot.info or {}).get("subject", "")
                 if not subject.startswith("pdfsuite:measure_"):
                     continue
-                pts = [pymupdf.Point(p) for p in (annot.vertices or [])]
+                pts = [(p[0], p[1]) for p in (annot.vertices or [])]
                 if len(pts) < 2:
                     continue
                 kind = subject.split("_", 1)[1]
                 if kind == "line":
-                    length = math.dist(pts[0], pts[1])
-                    area = None
+                    length, area = self.poly_perimeter(pts, closed=False), None
                 else:
-                    n = len(pts)
-                    length = sum(math.dist(pts[k], pts[(k + 1) % n]) for k in range(n))
-                    area = abs(sum(pts[k].x * pts[(k + 1) % n].y - pts[(k + 1) % n].x * pts[k].y
-                                   for k in range(n))) / 2
+                    length, area = self.poly_perimeter(pts), self.poly_area(pts)
                 rows.append({
                     "page": i + 1,
                     "type": {"line": "Longueur", "perimeter": "Périmètre",
                              "area": "Surface"}.get(kind, kind),
-                    "length_m": length / scale if scale else None,
-                    "area_m2": area / (scale * scale) if (scale and area is not None) else None,
-                    "label": (annot.info or {}).get("content", ""),
+                    "length": length / scale / u if scale else None,
+                    "area": area / (scale * scale) if (scale and area is not None) else None,
+                    "label": self.measure_label(subject, pts),
                 })
         return rows
 
@@ -484,17 +599,19 @@ class PdfDocument:
         import csv
 
         def num(v):
-            return "" if v is None else f"{v:.3f}".replace(".", ",")
+            return "" if v is None else f"{v:.{max(self.decimals, 2)}f}".replace(".", ",")
 
+        unit = self.unit
         rows = self.measurements()
         with open(out_path, "w", newline="", encoding="utf-8-sig") as f:
             w = csv.writer(f, delimiter=";")
-            w.writerow(["N°", "Page", "Type", "Longueur / périmètre (m)", "Surface (m²)"])
+            w.writerow([self.scale_description()])
+            w.writerow(["N°", "Page", "Type", f"Longueur / périmètre ({unit})", "Surface (m²)"])
             for n, r in enumerate(rows, start=1):
-                w.writerow([n, r["page"], r["type"], num(r["length_m"]), num(r["area_m2"])])
+                w.writerow([n, r["page"], r["type"], num(r["length"]), num(r["area"])])
             if rows:
-                total_len = sum(r["length_m"] or 0 for r in rows if r["type"] == "Longueur")
-                total_area = sum(r["area_m2"] or 0 for r in rows if r["area_m2"] is not None)
+                total_len = sum(r["length"] or 0 for r in rows if r["type"] == "Longueur")
+                total_area = sum(r["area"] or 0 for r in rows if r["area"] is not None)
                 w.writerow([])
                 w.writerow(["", "", "Total longueurs", num(total_len), ""])
                 w.writerow(["", "", "Total surfaces", "", num(total_area)])

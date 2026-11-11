@@ -88,9 +88,9 @@ class CalibrationDialog(QDialog):
 
     UNITS = {"mm": 0.001, "cm": 0.01, "m": 1.0}
 
-    def __init__(self, parent=None):
+    def __init__(self, parent=None, default_unit: str = "m"):
         super().__init__(parent)
-        self.setWindowTitle("Échelle du plan")
+        self.setWindowTitle("Calibrer l'échelle")
         layout = QVBoxLayout(self)
         layout.addWidget(QLabel(
             "Quelle est la longueur réelle représentée par la ligne\n"
@@ -104,7 +104,7 @@ class CalibrationDialog(QDialog):
         row.addWidget(self.value_spin)
         self.unit_combo = QComboBox()
         self.unit_combo.addItems(list(self.UNITS.keys()))
-        self.unit_combo.setCurrentText("m")
+        self.unit_combo.setCurrentText(default_unit if default_unit in self.UNITS else "m")
         row.addWidget(self.unit_combo)
         layout.addLayout(row)
         layout.addWidget(QLabel(
