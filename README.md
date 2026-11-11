@@ -40,7 +40,10 @@ n'est jamais écrasé (nom proposé : `…_modifié.pdf`).
   (Ctrl + molette sous le curseur, boutons, curseur et liste de zoom dans la
   barre d'état, Ctrl+0 / Ctrl+1 / Ctrl+2) même sur de gros plans A0/A1 —
   seule la zone visible est recalculée en haute définition, vignettes réorganisables, thème clair / sombre.
-- **Commentaires** : surligner, souligner, barrer, texte libre, note, dessin,
+- **Sélection** : cliquer un objet puis touche **Suppr** pour l'effacer.
+- **Couleur** : la fenêtre de couleur reste ouverte, chaque couleur cliquée
+  s'applique tout de suite (on peut surligner sans valider).
+- **Commentaires** : surligner (les espaces entre les mots aussi), souligner, barrer, texte libre, note, dessin,
   rectangle, ellipse, ligne, **flèche**, **nuage de révision**, **légende**
   (texte + trait vers le point visé, pointe déplaçable), **tampons de chantier**
   (APPROUVÉ, BON POUR EXÉCUTION, VU, À REVOIR, REFUSÉ ou texte personnalisé,
@@ -52,7 +55,8 @@ n'est jamais écrasé (nom proposé : `…_modifié.pdf`).
     Maj = 0° / 45° / 90°), puis déplacer la souris pour **décaler la cote**
     et cliquer pour la poser — lignes de rappel, traits obliques, longueur
     écrite le long de la ligne. Une cote posée se **fait coulisser** à la
-    souris (décalage), ses points A / B se déplacent par leurs poignées,
+    souris (décalage), ses points A / B se déplacent par leurs poignées
+    (Maj = reste orthogonale),
     clic droit → Changer de côté / Verrouiller / Supprimer ;
   - Périmètre, **Surface (m²)** ;
   - **Barre « Mesure »** sous le ruban (visible avec un outil de mesure ou
@@ -67,7 +71,10 @@ n'est jamais écrasé (nom proposé : `…_modifié.pdf`).
   - cotes lisibles à tous les zooms ; surfaces toujours en m² ;
   - **Règles** graduées en unités réelles + taille de page et position X / Y
     du curseur dans la barre d'état ;
-  - **Grille** + **Aimanter** ;
+  - **Aimanter** (activé par défaut) : les clics s'accrochent au dessin du
+    plan — extrémités et coins (carré vert), milieux (triangle) — et à la
+    grille si elle est affichée ; maintenir **Maj** désactive l'aimant ;
+  - **Grille** ;
   - **Exporter mesures** : CSV pour Excel (totaux inclus) ;
   - **Comparer** deux versions d'un plan : rouge = supprimé, vert = ajouté
     (les deux plans doivent avoir la même mise en page) ;

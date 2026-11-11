@@ -112,6 +112,10 @@ def click(p, button=Qt.LeftButton):
 
 win._activate_tool(Tool.MEASURE_LINE)
 check("measure bar visible with measure tool", win.measure_holder.isVisible())
+check("default scale 1:50", abs(doc.ratio() - 50) < 1e-6 and "par défaut" in bar.warning.text(),
+      bar.warning.text())
+doc._scale = None          # simulate a document without any scale
+bar.refresh()
 check("bar asks for the scale", "Saisissez" in bar.warning.text())
 required = []
 view.scaleRequired.connect(lambda: required.append(1))

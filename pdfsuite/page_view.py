@@ -234,7 +234,9 @@ class PdfGraphicsView(QGraphicsView):
         self._poly_preview_item = None
 
         self.show_grid = False
-        self.snap_to_grid = False
+        self.snap_to_grid = True          # « Aimanter » : points du plan (+ grille si affichée)
+        self._snap_marker = None
+        self._last_snap = None
         self.invert_colors = False
         self.stamp_label = "APPROUVÉ"
         self._loupe: QLabel | None = None
@@ -429,9 +431,11 @@ class PdfGraphicsView(QGraphicsView):
         if keep_page is not None and 0 <= keep_page < len(self.page_items):
             self.goto_page(keep_page)
         self._form_proxies = []
+        self._snap_marker = None
         if self.form_mode:
             self._add_form_widgets()
         self._update_visible()
+        QTimer.singleShot(400, self._prepare_snap)
 
     # -- vector annotation layer ------------------------------------------
     def _rebuild_page_annotations(self, item: PageItem):
@@ -459,6 +463,25 @@ class PdfGraphicsView(QGraphicsView):
             self._scene.removeItem(qitem)
         if item is not None and qitem in item.annot_items:
             item.annot_items.remove(qitem)
+
+    def delete_selected(self) -> bool:
+        """Delete key: remove every selected annotation (shapes, measures,
+        cotes, stamps, notes, highlights...)."""
+        targets = [it for it in self._scene.selectedItems() if hasattr(it, "annot")]
+        if not targets:
+            return False
+        for it in targets:
+            if getattr(it, "locked", False):
+                continue
+            if it.annot is not None:
+                self.doc.delete_annot(it.page_no, it.annot)
+            self.remove_annotation_item(it.page_no, it)
+            for h in getattr(it, "handles", []):
+                if h.scene() is not None:
+                    self._scene.removeItem(h)
+                self.remove_annotation_item(it.page_no, h)
+        self.documentModified.emit()
+        return True
 
     def rebuild_annotations(self):
         for item in self.page_items:
@@ -720,13 +743,76 @@ class PdfGraphicsView(QGraphicsView):
                 painter.drawLine(QPointF(r.left(), y), QPointF(r.right(), y))
 
     # -- coordinates --------------------------------------------------------
-    def _scene_to_visual(self, item: PageItem, scene_pos: QPointF) -> pymupdf.Point:
+    SNAP_PX = 11          # snap radius on screen
+
+    def snap_visual(self, page_no: int, x: float, y: float):
+        """Snap a visual page point: drawing ends/corners/midpoints first,
+        then the grid when it is shown. Returns (x, y, kind) — kind 0 = end
+        or corner, 1 = midpoint, 2 = grid — or None."""
+        if not self.snap_to_grid:
+            return None
+        hit = self.doc.snap_point(page_no, x, y, self.SNAP_PX / self.zoom)
+        if hit is not None:
+            return hit
+        if self.show_grid:
+            st = self.grid_spacing()
+            return round(x / st) * st, round(y / st) * st, 2
+        return None
+
+    def _scene_to_visual(self, item: PageItem, scene_pos: QPointF, snap: bool = True) -> pymupdf.Point:
         local = scene_pos - item.pos()
         pt = pymupdf.Point(local.x(), local.y())
-        if self.snap_to_grid and self.tool not in (Tool.PAN, Tool.SELECT):
-            st = self.grid_spacing()
-            pt = pymupdf.Point(round(pt.x / st) * st, round(pt.y / st) * st)
+        shift = QApplication.keyboardModifiers() & Qt.ShiftModifier
+        if snap and not shift and self.tool not in (Tool.PAN, Tool.SELECT):
+            hit = self.snap_visual(item.page_no, pt.x, pt.y)
+            if hit is not None:
+                pt = pymupdf.Point(hit[0], hit[1])
         return pt
+
+    def _update_snap_marker(self, viewport_pos):
+        """Small marker showing where the next click will snap:
+        square = end / corner, triangle = midpoint, cross = grid."""
+        hit = None
+        item = None
+        if self.snap_to_grid and self.tool not in (Tool.PAN, Tool.SELECT) \
+                and not (QApplication.keyboardModifiers() & Qt.ShiftModifier):
+            scene_pos = self.mapToScene(viewport_pos)
+            item = self._item_at_scene(scene_pos)
+            if item is not None:
+                local = scene_pos - item.pos()
+                hit = self.snap_visual(item.page_no, local.x(), local.y())
+        if hit is None:
+            if self._snap_marker is not None:
+                self._snap_marker.hide()
+            return
+        if self._snap_marker is None:
+            self._snap_marker = QGraphicsPathItem()
+            self._snap_marker.setFlag(QGraphicsItem.ItemIgnoresTransformations, True)
+            self._snap_marker.setZValue(50)
+            pen = QPen(QColor(0, 170, 80), 2)
+            pen.setCosmetic(True)
+            self._snap_marker.setPen(pen)
+            self._scene.addItem(self._snap_marker)
+        path = QPainterPath()
+        if hit[2] == 0:
+            path.addRect(QRectF(-6, -6, 12, 12))
+        elif hit[2] == 1:
+            path.moveTo(0, -7); path.lineTo(6.5, 5); path.lineTo(-6.5, 5); path.closeSubpath()
+        else:
+            path.moveTo(-6, 0); path.lineTo(6, 0); path.moveTo(0, -6); path.lineTo(0, 6)
+        self._snap_marker.setPath(path)
+        self._snap_marker.setPos(item.pos() + QPointF(hit[0], hit[1]))
+        self._snap_marker.show()
+
+    def _prepare_snap(self):
+        """Build the snap index of the visible page in the background
+        (idle time), so the first hover does not stall."""
+        if not self.snap_to_grid or not self.page_items or getattr(self, "_closed", False):
+            return
+        try:
+            self.doc.snap_index(self.current_page())
+        except Exception:
+            pass
 
     def _scene_to_pdf_point(self, item: PageItem, scene_pos: QPointF) -> pymupdf.Point:
         page = self.doc.page(item.page_no)
@@ -843,6 +929,7 @@ class PdfGraphicsView(QGraphicsView):
         self._emit_cursor_info(event.pos())
         if self.loupe_enabled:
             self._update_loupe(event.pos())
+        self._update_snap_marker(event.pos())
         if self.tool == Tool.DIMENSION and self._dim is not None:
             self._dimension_move(event)
             return
@@ -1015,6 +1102,9 @@ class PdfGraphicsView(QGraphicsView):
             if event.key() == Qt.Key_Backspace and self._poly_points:
                 self._poly_points.pop()
                 self._update_poly_preview()
+                return
+        if event.key() == Qt.Key_Delete and self._dim is None and not self._poly_points:
+            if self.delete_selected():
                 return
         if event.key() == Qt.Key_Escape and self._dim is not None:
             self._cancel_dimension()

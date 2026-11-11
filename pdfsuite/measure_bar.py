@@ -113,8 +113,15 @@ class MeasureBar(QFrame):
         self.apply_defaults(doc)
         self.refresh()
 
+    DEFAULT_RATIO = 50      # 1 cm sur le plan = 0,5 m en réel
+
     def apply_defaults(self, doc):
-        """Documents without stored unit/precision get the last ones used."""
+        """Documents without stored scale get 1:50 (not written into the
+        PDF until changed); unit / precision default to the last used."""
+        if not doc.scale_points_per_meter:
+            from .pdf_document import POINTS_PER_PAPER_METER
+            doc._scale = POINTS_PER_PAPER_METER / self.DEFAULT_RATIO
+            doc.scale_is_default = True
         if not doc.unit_from_file:
             doc._unit = self.settings.value("measure_unit", "m")
         if getattr(doc, "_decimals", None) is None:
@@ -133,7 +140,9 @@ class MeasureBar(QFrame):
         if ratio:
             paper_m = self.paper.value() * UNIT_M[self.paper_unit.currentText()]
             self.real.setValue(paper_m * ratio / UNIT_M[doc.unit])
-            self.warning.setText(f"<span style='color:#2e7d32'>✔ 1:{ratio:g}</span>".replace(".", ","))
+            default = " (par défaut)" if getattr(doc, "scale_is_default", False) else ""
+            self.warning.setText(
+                f"<span style='color:#2e7d32'>✔ 1:{ratio:g}{default}</span>".replace(".", ","))
         else:
             self.real.setValue(0)
             self.warning.setText(
@@ -157,6 +166,7 @@ class MeasureBar(QFrame):
         self.doc.unit = self.real_unit.currentText()
         self.doc.set_paper_real_scale(paper, self.paper_unit.currentText(),
                                       real, self.real_unit.currentText())
+        self.doc.scale_is_default = False
         self._done()
 
     def _on_unit_changed(self):
@@ -180,6 +190,7 @@ class MeasureBar(QFrame):
         self.presets.setCurrentIndex(0)
         self.doc.unit = self.real_unit.currentText()
         self.doc.set_ratio_scale(n)
+        self.doc.scale_is_default = False
         self._done()
 
     def _on_precision(self, index: int):

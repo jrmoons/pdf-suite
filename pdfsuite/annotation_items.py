@@ -82,8 +82,31 @@ class VertexHandle(QGraphicsEllipseItem):
 
     def itemChange(self, change, value):
         if change == QGraphicsItem.ItemPositionChange and self.scene() is not None:
+            value = self._adjust(QPointF(value))
             self.owner.handle_moving(self.index, value)
+            return value
         return super().itemChange(change, value)
+
+    def _adjust(self, pos: QPointF) -> QPointF:
+        """Shift held: keep the segment to the neighbouring point at
+        0 / 45 / 90°. Otherwise snap to the drawing (Aimanter)."""
+        from PySide6.QtWidgets import QApplication
+        view = self.owner.view
+        anchor = self.owner.anchor_for(self.index) if hasattr(self.owner, "anchor_for") else None
+        if QApplication.keyboardModifiers() & Qt.ShiftModifier:
+            if anchor is None:
+                return pos
+            dx, dy = pos.x() - anchor.x(), pos.y() - anchor.y()
+            ang = math.atan2(dy, dx)
+            snapped = round(ang / (math.pi / 4)) * (math.pi / 4)
+            length = math.hypot(dx, dy) * math.cos(ang - snapped)
+            return QPointF(anchor.x() + length * math.cos(snapped),
+                           anchor.y() + length * math.sin(snapped))
+        if hasattr(view, "snap_visual"):
+            hit = view.snap_visual(self.owner.page_no, pos.x(), pos.y())
+            if hit is not None and hit[2] != 2:
+                return QPointF(hit[0], hit[1])
+        return pos
 
     def mouseReleaseEvent(self, event):
         super().mouseReleaseEvent(event)
@@ -489,6 +512,11 @@ class MeasureItemBase(QGraphicsObject):
             h.set_locked(locked)
         self.update()
 
+    def anchor_for(self, index: int):
+        if len(self.points) < 2:
+            return None
+        return self.points[index - 1] if index > 0 else self.points[1]
+
     def handle_moving(self, index: int, new_pos: QPointF):
         self.prepareGeometryChange()
         self.points[index] = QPointF(new_pos)
@@ -809,6 +837,9 @@ class DimensionItem(QGraphicsObject):
             h.setPos(pt)
             self.handles.append(h)
         return self.handles
+
+    def anchor_for(self, index: int):
+        return self.b if index == 0 else self.a
 
     def handle_moving(self, index: int, new_pos: QPointF):
         self.prepareGeometryChange()

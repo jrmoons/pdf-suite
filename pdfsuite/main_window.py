@@ -201,7 +201,10 @@ class MainWindow(QMainWindow):
         self.act_grid = self._act("Grille", self.toggle_grid, "grid", checkable=True,
                                   tip="Afficher une grille (pas en mètres si l'échelle est connue)")
         self.act_snap = self._act("Aimanter", self.toggle_snap, "snap", checkable=True,
-                                  tip="Accrocher les tracés aux points de la grille")
+                                  tip="Accrocher au dessin : extrémités et coins (carré vert), "
+                                      "milieux (triangle), et à la grille si elle est affichée. "
+                                      "Maj = désactive l'aimant le temps du tracé.")
+        self.act_snap.setChecked(bool(self.settings.value("snap", True, type=bool)))
 
         # pages
         self.act_insert_blank = self._act("Page vierge", self.insert_blank_page, "insertblank")
@@ -527,6 +530,7 @@ class MainWindow(QMainWindow):
         view.set_measure_color(self.measure_bar.color)
         view.set_rulers(self.act_rulers.isChecked())
         view.set_gpu(self.act_gpu.isChecked())
+        view.snap_to_grid = self.act_snap.isChecked()
         view.filesDropped.connect(self.open_files)
         view.scaleRequired.connect(self._on_scale_required)
         view.scaleCalibrated.connect(lambda t=tab: self._on_measure_settings())
@@ -709,14 +713,19 @@ class MainWindow(QMainWindow):
         if tab is None:
             return
         if tab.dirty:
-            resp = QMessageBox.question(
-                self, "Modifications non enregistrées",
-                "Enregistrer les modifications avant de fermer ?",
-                QMessageBox.Save | QMessageBox.Discard | QMessageBox.Cancel,
-            )
-            if resp == QMessageBox.Cancel:
+            box = QMessageBox(QMessageBox.Question, "Modifications non enregistrées",
+                              f"« {self.tabs.tabText(index).rstrip(' *')} » a été modifié.\n"
+                              "Enregistrer les modifications avant de fermer ?", parent=self)
+            btn_save = box.addButton("Enregistrer…", QMessageBox.AcceptRole)
+            btn_discard = box.addButton("Ne pas enregistrer", QMessageBox.DestructiveRole)
+            btn_cancel = box.addButton("Annuler", QMessageBox.RejectRole)
+            box.setDefaultButton(btn_save)
+            box.setEscapeButton(btn_cancel)
+            box.exec()
+            clicked = box.clickedButton()
+            if clicked is btn_cancel or clicked is None:
                 return
-            if resp == QMessageBox.Save:
+            if clicked is btn_save:
                 self.tabs.setCurrentIndex(index)
                 if not self.save_current():
                     return
@@ -740,14 +749,31 @@ class MainWindow(QMainWindow):
         self._select_tool(tool)
 
     def pick_color(self):
-        c = QColorDialog.getColor(QColor.fromRgbF(*self._current_color), self, "Couleur")
-        if c.isValid():
-            self._current_color = (c.redF(), c.greenF(), c.blueF())
-            tab = self.current_tab()
-            if tab is not None:
-                for v in tab.views():
-                    v.set_color(self._current_color)
-            self._apply_icons()
+        """Colour window that stays open: every colour clicked is applied
+        at once, so you can pick a colour and keep highlighting / drawing
+        without validating anything."""
+        dlg = getattr(self, "_color_dlg", None)
+        if dlg is None:
+            dlg = QColorDialog(QColor.fromRgbF(*self._current_color), self)
+            dlg.setWindowTitle("Couleur — reste ouverte, cliquez une couleur puis continuez")
+            dlg.setOption(QColorDialog.DontUseNativeDialog, True)
+            dlg.setOption(QColorDialog.NoButtons, True)
+            dlg.setWindowFlag(Qt.Tool, True)
+            dlg.setModal(False)
+            dlg.currentColorChanged.connect(self._set_current_color)
+            self._color_dlg = dlg
+        dlg.setCurrentColor(QColor.fromRgbF(*self._current_color))
+        dlg.show()
+        dlg.raise_()
+
+    def _set_current_color(self, c: QColor):
+        if not c.isValid():
+            return
+        self._current_color = (c.redF(), c.greenF(), c.blueF())
+        for i in range(self.tabs.count()):
+            for v in self.tabs.widget(i).views():
+                v.set_color(self._current_color)
+        self._apply_icons()
 
     def _stamp_label(self) -> str:
         if not hasattr(self, "_custom_stamp"):
@@ -876,13 +902,12 @@ class MainWindow(QMainWindow):
         self._update_scale_label()
 
     def toggle_snap(self, checked: bool):
-        tab = self.current_tab()
-        if tab is not None:
-            for v in tab.views():
+        self.settings.setValue("snap", checked)
+        for i in range(self.tabs.count()):
+            for v in self.tabs.widget(i).views():
                 v.snap_to_grid = checked
-            if checked and not self.act_grid.isChecked():
-                self.act_grid.setChecked(True)
-                self.toggle_grid(True)
+                if checked:
+                    v._prepare_snap()
 
     def toggle_loupe(self, checked: bool):
         for i in range(self.tabs.count()):

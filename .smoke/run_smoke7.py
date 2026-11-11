@@ -157,7 +157,8 @@ check("Escape returns to Select", view.tool == Tool.SELECT and win._tool_actions
 
 # -- 21. grid + snap --------------------------------------------------------
 win.act_snap.setChecked(True); win.toggle_snap(True)
-check("snap turns grid on", view.show_grid and win.act_grid.isChecked())
+win.act_grid.setChecked(True); win.toggle_grid(True)
+check("grid shown + snap on", view.show_grid and view.snap_to_grid)
 step = view.grid_spacing()
 win._activate_tool(Tool.LINE)
 p = view._scene_to_pdf_point(item, view._pdf_to_scene(item, pymupdf.Point(203.3, 207.9)))

@@ -51,6 +51,81 @@ class PdfDocument:
     def _invalidate_pages(self):
         self._page_cache = {}
         self._dl_cache = {}
+        self._snap_cache = {}
+
+    # -- object snapping ----------------------------------------------------
+    SNAP_CELL = 24.0     # spatial hash cell, in PDF points
+
+    def snap_index(self, index: int):
+        """Points of the drawing a measurement can snap to (line ends,
+        corners, midpoints), in visual page coordinates, bucketed in a
+        spatial hash. Built once per page (≈0.3 s on a big plan)."""
+        if not hasattr(self, "_snap_cache"):
+            self._snap_cache = {}
+        idx = self._snap_cache.get(index)
+        if idx is not None:
+            return idx
+        page = self.page(index)
+        m = ~page.derotation_matrix if page.rotation else None
+        cell = self.SNAP_CELL
+        grid: dict = {}
+
+        def add(x, y, kind):
+            if m is not None:
+                p = pymupdf.Point(x, y) * m
+                x, y = p.x, p.y
+            key = (int(x // cell), int(y // cell))
+            grid.setdefault(key, []).append((x, y, kind))
+
+        try:
+            drawings = page.get_cdrawings()
+        except Exception:
+            drawings = []
+        for path in drawings:
+            for it in path.get("items", ()):
+                op = it[0]
+                if op == "l":
+                    (x0, y0), (x1, y1) = it[1], it[2]
+                    add(x0, y0, 0)
+                    add(x1, y1, 0)
+                    if abs(x1 - x0) + abs(y1 - y0) > 2:
+                        add((x0 + x1) / 2, (y0 + y1) / 2, 1)
+                elif op == "c":
+                    add(it[1][0], it[1][1], 0)
+                    add(it[4][0], it[4][1], 0)
+                elif op == "re":
+                    r = pymupdf.Rect(it[1])
+                    for x, y in ((r.x0, r.y0), (r.x1, r.y0), (r.x1, r.y1), (r.x0, r.y1)):
+                        add(x, y, 0)
+                elif op == "qu":
+                    q = it[1]
+                    for pt in (q[0], q[1], q[2], q[3]):
+                        add(pt[0], pt[1], 0)
+        # de-duplicate (plans repeat the same point many times)
+        for key, pts in grid.items():
+            grid[key] = list({(round(x, 2), round(y, 2), k) for x, y, k in pts})
+        self._snap_cache[index] = grid
+        return grid
+
+    def snap_point(self, index: int, x: float, y: float, radius: float):
+        """Nearest snap point within ``radius`` (visual coords), ends and
+        corners preferred over midpoints. Returns (x, y, kind) or None."""
+        grid = self.snap_index(index)
+        cell = self.SNAP_CELL
+        best, best_score = None, None
+        cx0, cx1 = int((x - radius) // cell), int((x + radius) // cell)
+        cy0, cy1 = int((y - radius) // cell), int((y + radius) // cell)
+        r2 = radius * radius
+        for cx in range(cx0, cx1 + 1):
+            for cy in range(cy0, cy1 + 1):
+                for px, py, kind in grid.get((cx, cy), ()):
+                    d2 = (px - x) ** 2 + (py - y) ** 2
+                    if d2 > r2:
+                        continue
+                    score = d2 + (kind * r2 * 0.25)
+                    if best_score is None or score < best_score:
+                        best, best_score = (px, py, kind), score
+        return best
 
     def invalidate_render(self, index: int | None = None):
         """Forget the cached drawing of a page whose content changed."""
@@ -58,8 +133,10 @@ class PdfDocument:
             self._dl_cache = {}
         if index is None:
             self._dl_cache = {}
+            self._snap_cache = {}
         else:
             self._dl_cache.pop(index, None)
+            getattr(self, "_snap_cache", {}).pop(index, None)
 
     def display_list(self, index: int):
         """Parsed drawing of a page (content only, no annotations), cached:
@@ -101,6 +178,7 @@ class PdfDocument:
     def scale_points_per_meter(self, value: float | None):
         """Also written into the PDF so the scale survives a reopen."""
         self._scale = value if value and value > 0 else None
+        self.scale_is_default = False
         try:
             cat = self.doc.pdf_catalog()
             self.doc.xref_set_key(cat, SCALE_KEY,
@@ -680,13 +758,16 @@ class PdfDocument:
         return False
 
     def words_in_rect(self, index: int, rect):
+        """Selected text as one rectangle per line (so the spaces between
+        words are highlighted too, like the words themselves)."""
         words = self.page(index).get_text("words")
-        out = []
+        lines: dict = {}
         for w in words:
             wrect = pymupdf.Rect(w[:4])
             if wrect.intersects(rect):
-                out.append(wrect)
-        return out
+                key = (w[5], w[6])          # block, line
+                lines[key] = lines[key] | wrect if key in lines else wrect
+        return [lines[k] for k in sorted(lines)]
 
     # -- text block editing -------------------------------------------
     def text_blocks(self, index: int):

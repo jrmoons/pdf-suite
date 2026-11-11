@@ -24,6 +24,10 @@
   GPU : `PdfGraphicsView.set_gpu` (QOpenGLWidget) ; `viewport().grab()` rend BLANC avec le
   GPU → utiliser `QGraphicsView.render()` (loupe) ; vérifier visuellement via
   `QScreen.grabWindow`. Changer de viewport détruit ses widgets enfants (MeasureInfo recréé).
+- Aimant = `PdfDocument.snap_index/snap_point` (points du dessin via `get_cdrawings`, hachage
+  spatial, préparé au repos) ; `view.snap_to_grid` = interrupteur « Aimanter ». Échelle par
+  défaut 1:50 en mémoire seulement (`scale_is_default`), pas écrite tant que non modifiée.
+  Textes Qt en français : `main.install_french` (qtbase_fr.qm).
 - Cote = `DimensionItem` (annotation_items), stockée en PolyLine A, A', B', B,
   subject `pdfsuite:measure_dimension`.
 - Texte modifié : `replace_text_in_rect` réécrit à l'origine/couleur/direction du span
