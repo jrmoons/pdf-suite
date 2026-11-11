@@ -11,5 +11,16 @@
   refaire des `doc[i]` répétés, sinon erreur « annotation not bound to any page ».
 - Annotations = items vectoriels Qt (`annotation_items.py`), page rendue avec `annots=False`.
 - Règle : ne citer aucun logiciel PDF tiers comme source ou inspiration (code, README, commits).
-- Pas encore fait : annuler/refaire, OCR, recherche plein texte, impression, conversions,
-  combiner des fichiers, mesure de surface, compression.
+- Préférences de Jérémy (2026-11-11) : implémenter les 52 idées par lots (testé + commit +
+  push à chaque lot) ; ruban à onglets ; Ctrl+S = toujours « Enregistrer sous » (l'original
+  n'est jamais écrasé, `PdfDocument.is_original`) ; l'outil reste actif, Échap → Sélection ;
+  composants lourds acceptés : OCR Tesseract (fra) et PDF → Word/Excel ; PAS OpenCV ni pyhanko.
+- Géométrie exacte des formes stockée dans une clé d'annotation `PDFSuiteGeom`
+  (`PdfDocument.set_geom/get_geom`) ; échelle du plan dans la clé de catalogue `PDFSuiteScale`.
+  Annotations maison identifiées par `subject` = `pdfsuite:…`.
+- Fait : lot 1 « Plans / chantier » (surface, échelles, export CSV, comparaison, nuage,
+  flèche, légende, tampons, grille + aimant, loupe, capture, inversion, vue fractionnée).
+- À faire : annuler/refaire, combiner, pages vides/doublons, recadrer, redimensionner,
+  découper/fusionner pages, en-tête/numérotation, filigrane, aplatir, caviardage,
+  compression, OCR, signets, panneau commentaires, export images, impression,
+  conversions Word/Excel, etc.

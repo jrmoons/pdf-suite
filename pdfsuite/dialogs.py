@@ -121,6 +121,55 @@ class CalibrationDialog(QDialog):
         return self.value_spin.value() * self.UNITS[self.unit_combo.currentText()]
 
 
+SCALE_PRESETS = [1, 5, 10, 20, 25, 50, 75, 100, 200, 250, 500, 1000, 2000, 5000]
+
+
+class ScaleDialog(QDialog):
+    """Choose the plan scale: a standard 1:N ratio, or "calibrate" by
+    drawing a line of known length on the plan."""
+
+    def __init__(self, parent=None, current: str = ""):
+        super().__init__(parent)
+        from PySide6.QtWidgets import QRadioButton, QSpinBox
+        self.setWindowTitle("Échelle du plan")
+        layout = QVBoxLayout(self)
+        if current:
+            layout.addWidget(QLabel(current))
+        self.radio_preset = QRadioButton("Échelle du plan (imprimé à 100 %) :")
+        self.radio_preset.setChecked(True)
+        layout.addWidget(self.radio_preset)
+        row = QHBoxLayout()
+        row.addSpacing(20)
+        self.preset_combo = QComboBox()
+        self.preset_combo.setEditable(True)
+        self.preset_combo.addItems([f"1:{n}" for n in SCALE_PRESETS])
+        self.preset_combo.setCurrentText("1:50")
+        row.addWidget(self.preset_combo)
+        row.addStretch()
+        layout.addLayout(row)
+        self.radio_calib = QRadioButton(
+            "Calibrer : je trace une ligne de longueur connue\n"
+            "(la prochaine mesure de ligne me demandera sa longueur réelle)")
+        layout.addWidget(self.radio_calib)
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+    def ratio(self) -> float | None:
+        """1:N -> N, or None when the user chose calibration."""
+        if self.radio_calib.isChecked():
+            return None
+        text = self.preset_combo.currentText().replace(" ", "").replace(",", ".")
+        if ":" in text:
+            text = text.split(":", 1)[1]
+        try:
+            n = float(text)
+        except ValueError:
+            return None
+        return n if n > 0 else None
+
+
 class SignatureCanvas(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)

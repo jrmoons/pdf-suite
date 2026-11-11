@@ -1,18 +1,21 @@
 from __future__ import annotations
 
+import datetime
+import getpass
 import math
 
 import pymupdf
-from PySide6.QtCore import Qt, QPointF, QRectF, Signal
-from PySide6.QtGui import QImage, QPixmap, QPen, QColor, QPainterPath, QBrush
+from PySide6.QtCore import Qt, QPointF, QRectF, QRect, QSize, Signal
+from PySide6.QtGui import QImage, QPixmap, QPen, QColor, QPainterPath, QBrush, QPainter
 from PySide6.QtWidgets import (
     QGraphicsView, QGraphicsScene, QGraphicsPixmapItem, QGraphicsRectItem,
     QGraphicsEllipseItem, QGraphicsLineItem, QGraphicsPathItem, QInputDialog,
-    QGraphicsProxyWidget, QLineEdit, QCheckBox, QComboBox, QDialog,
+    QGraphicsProxyWidget, QLineEdit, QCheckBox, QComboBox, QDialog, QLabel,
+    QApplication,
 )
 
 from .tools import Tool, DRAG_TOOLS, POLY_TOOLS
-from .pdf_document import PdfDocument
+from .pdf_document import PdfDocument, STAMP_COLORS
 from .dialogs import CalibrationDialog
 from . import annotation_items as ai
 
@@ -44,6 +47,8 @@ class PdfGraphicsView(QGraphicsView):
     statusMessage = Signal(str)
     requestTextEdit = Signal(int, object, str, float)
     requestSignaturePlacement = Signal(int, object)
+    requestSelectTool = Signal()      # Échap : retour à l'outil Sélection
+    cursorInfo = Signal(str)          # coordonnées sous le curseur
 
     def __init__(self, document: PdfDocument, parent=None):
         super().__init__(parent)
@@ -74,12 +79,20 @@ class PdfGraphicsView(QGraphicsView):
         self._poly_points: list = []
         self._poly_preview_item = None
 
+        # plan-reading aids
+        self.show_grid = False
+        self.snap_to_grid = False
+        self.invert_colors = False
+        self.stamp_label = "APPROUVÉ"
+        self._loupe: QLabel | None = None
+        self.loupe_enabled = False
+
         self.verticalScrollBar().valueChanged.connect(self._on_scrolled)
         self.build_scene()
 
     # ------------------------------------------------------------------
     def set_tool(self, tool: Tool):
-        if self.tool == Tool.MEASURE_PERIMETER and tool != Tool.MEASURE_PERIMETER:
+        if self.tool in POLY_TOOLS and tool != self.tool:
             self._cancel_polygon()
         self.tool = tool
         self.setDragMode(
@@ -273,7 +286,12 @@ class PdfGraphicsView(QGraphicsView):
         live in their own vector layer and never need this."""
         if 0 <= n < len(self.page_items):
             pix = self.doc.render_page(n, self.zoom)
-            self.page_items[n].setPixmap(pixmap_to_qpixmap(pix))
+            qpix = pixmap_to_qpixmap(pix)
+            if self.invert_colors:
+                img = qpix.toImage()
+                img.invertPixels()
+                qpix = QPixmap.fromImage(img)
+            self.page_items[n].setPixmap(qpix)
             self.page_items[n].rendered = True
 
     def refresh_all(self):
@@ -306,15 +324,68 @@ class PdfGraphicsView(QGraphicsView):
                 return item
         return None
 
+    # -- grid / snapping ------------------------------------------------
+    def grid_spacing(self) -> float:
+        """Grid step in PDF points: a round real-world length when the
+        plan scale is known, otherwise a round paper length in mm."""
+        scale = self.doc.scale_points_per_meter
+        if scale:
+            steps = [s * scale for s in (0.01, 0.05, 0.1, 0.25, 0.5, 1, 2, 5, 10, 20, 50, 100)]
+        else:
+            steps = [mm * 72 / 25.4 for mm in (1, 2, 5, 10, 20, 50, 100)]
+        for st in steps:
+            if st * self.zoom >= 14:
+                return st
+        return steps[-1]
+
+    def grid_description(self) -> str:
+        st = self.grid_spacing()
+        scale = self.doc.scale_points_per_meter
+        if scale:
+            return f"Grille : {self.doc.format_length(st / scale)}"
+        return f"Grille : {round(st * 25.4 / 72)} mm (papier)"
+
+    def set_grid(self, show: bool):
+        self.show_grid = show
+        self.viewport().update()
+
+    def drawForeground(self, painter, rect):
+        if not self.show_grid:
+            return
+        step = self.grid_spacing() * self.zoom
+        if step <= 0:
+            return
+        minor = QPen(QColor(47, 111, 237, 50))
+        minor.setCosmetic(True)
+        major = QPen(QColor(47, 111, 237, 110))
+        major.setCosmetic(True)
+        for item in self.page_items:
+            r = QRectF(item.pos(), item.pixmap().size())
+            if not r.intersects(rect):
+                continue
+            nx = int(r.width() / step) + 1
+            ny = int(r.height() / step) + 1
+            for i in range(nx):
+                x = r.left() + i * step
+                painter.setPen(major if i % 5 == 0 else minor)
+                painter.drawLine(QPointF(x, r.top()), QPointF(x, r.bottom()))
+            for j in range(ny):
+                y = r.top() + j * step
+                painter.setPen(major if j % 5 == 0 else minor)
+                painter.drawLine(QPointF(r.left(), y), QPointF(r.right(), y))
+
     def _scene_to_pdf_point(self, item: PageItem, scene_pos: QPointF) -> pymupdf.Point:
         local = scene_pos - item.pos()
         pt = pymupdf.Point(local.x() / self.zoom, local.y() / self.zoom)
+        if self.snap_to_grid and self.tool not in (Tool.PAN, Tool.SELECT):
+            st = self.grid_spacing()
+            pt = pymupdf.Point(round(pt.x / st) * st, round(pt.y / st) * st)
         page = self.doc.page(item.page_no)
         return pt * page.derotation_matrix
 
     # ------------------------------------------------------------------
     def mousePressEvent(self, event):
-        if self.tool == Tool.MEASURE_PERIMETER:
+        if self.tool in POLY_TOOLS:
             self._handle_polygon_click(event)
             return
 
@@ -362,6 +433,10 @@ class PdfGraphicsView(QGraphicsView):
             self.requestSignaturePlacement.emit(page_no, pdf_pt)
             return
 
+        if self.tool == Tool.STAMP:
+            self.place_stamp(page_no, pdf_pt)
+            return
+
         if self.tool in DRAG_TOOLS:
             self._dragging = True
             self._drag_page = page_no
@@ -372,7 +447,10 @@ class PdfGraphicsView(QGraphicsView):
         super().mousePressEvent(event)
 
     def mouseMoveEvent(self, event):
-        if self.tool == Tool.MEASURE_PERIMETER and self._poly_points:
+        self._emit_cursor_info(event.pos())
+        if self.loupe_enabled:
+            self._update_loupe(event.pos())
+        if self.tool in POLY_TOOLS and self._poly_points:
             scene_pos = self.mapToScene(event.pos())
             self._update_poly_preview(extra_scene_pt=scene_pos)
             return
@@ -424,6 +502,25 @@ class PdfGraphicsView(QGraphicsView):
 
             elif self.tool == Tool.LINE:
                 self.doc.add_line(page_no, start, end, self.current_color)
+
+            elif self.tool == Tool.ARROW:
+                if math.hypot(end.x - start.x, end.y - start.y) < 3:
+                    return
+                self.doc.add_arrow(page_no, start, end, self.current_color)
+
+            elif self.tool == Tool.CLOUD:
+                if rect.width < 6 or rect.height < 6:
+                    return
+                self.doc.add_cloud(page_no, rect, self.current_color)
+
+            elif self.tool == Tool.CALLOUT:
+                self._create_callout(page_no, start, end)
+
+            elif self.tool == Tool.CAPTURE:
+                if rect.width < 3 or rect.height < 3:
+                    return
+                self.capture_to_clipboard(item, start, end)
+                return
 
             elif self.tool == Tool.INK:
                 if len(self._drag_points) < 2:
@@ -478,20 +575,24 @@ class PdfGraphicsView(QGraphicsView):
         self._update_poly_preview()
 
     def mouseDoubleClickEvent(self, event):
-        if self.tool == Tool.MEASURE_PERIMETER:
+        if self.tool in POLY_TOOLS:
             self._finish_polygon()
             event.accept()
             return
         super().mouseDoubleClickEvent(event)
 
     def keyPressEvent(self, event):
-        if self.tool == Tool.MEASURE_PERIMETER:
-            if event.key() == Qt.Key_Escape:
+        if self.tool in POLY_TOOLS:
+            if event.key() == Qt.Key_Escape and self._poly_points:
                 self._cancel_polygon()
                 return
             if event.key() in (Qt.Key_Return, Qt.Key_Enter):
                 self._finish_polygon()
                 return
+        if event.key() == Qt.Key_Escape and self.tool != Tool.SELECT:
+            # the tool stays active after each use; Échap goes back to Sélection
+            self.requestSelectTool.emit()
+            return
         super().keyPressEvent(event)
 
     def _update_poly_preview(self, extra_scene_pt: QPointF | None = None):
@@ -544,8 +645,13 @@ class PdfGraphicsView(QGraphicsView):
         meters = self.doc.points_to_meters(perimeter_pts)
         scale = self.doc.scale_points_per_meter
         area_m2 = area_pts2 / (scale * scale) if scale else 0.0
-        label = f"Périmètre {self.doc.format_length(meters)} · Surface {self.doc.format_area(area_m2)}"
-        self.doc.add_measure_polygon(page_no, points, self.current_color, label)
+        if self.tool == Tool.MEASURE_AREA:
+            label = f"Surface {self.doc.format_area(area_m2)}"
+            subject = "pdfsuite:measure_area"
+        else:
+            label = f"Périmètre {self.doc.format_length(meters)} · Surface {self.doc.format_area(area_m2)}"
+            subject = "pdfsuite:measure_perimeter"
+        self.doc.add_measure_polygon(page_no, points, self.current_color, label, subject)
         self._cancel_polygon()
         self._rebuild_page_annotations(self.page_items[page_no])
         self.documentModified.emit()
@@ -567,7 +673,7 @@ class PdfGraphicsView(QGraphicsView):
                 path.lineTo(self._pdf_to_scene(item, pt))
             self._preview_item = QGraphicsPathItem(path)
             self._preview_item.setPen(pen)
-        elif self.tool in (Tool.LINE, Tool.MEASURE_LINE):
+        elif self.tool in (Tool.LINE, Tool.MEASURE_LINE, Tool.ARROW, Tool.CALLOUT):
             p1 = self._pdf_to_scene(item, self._drag_points[-1])
             self._preview_item = QGraphicsLineItem(p0.x(), p0.y(), p1.x(), p1.y())
             self._preview_item.setPen(pen)
@@ -578,6 +684,8 @@ class PdfGraphicsView(QGraphicsView):
                 self._preview_item = QGraphicsEllipseItem(r)
             else:
                 self._preview_item = QGraphicsRectItem(r)
+            if self.tool == Tool.CAPTURE:
+                pen = QPen(QColor(47, 111, 237), 1.5, Qt.DashLine)
             self._preview_item.setPen(pen)
         self._preview_item.setZValue(10)
         self._scene.addItem(self._preview_item)
@@ -622,3 +730,113 @@ class PdfGraphicsView(QGraphicsView):
         self.doc.mark_dirty()
         self.refresh_page(page_no)
         self.documentModified.emit()
+
+    # -- cursor coordinates -----------------------------------------------
+    def _emit_cursor_info(self, viewport_pos):
+        scene_pos = self.mapToScene(viewport_pos)
+        item = self._item_at_scene(scene_pos)
+        if item is None:
+            self.cursorInfo.emit("")
+            return
+        local = scene_pos - item.pos()
+        x_pt, y_pt = local.x() / self.zoom, local.y() / self.zoom
+        scale = self.doc.scale_points_per_meter
+        if scale:
+            self.cursorInfo.emit(f"x {x_pt / scale:.2f} m · y {y_pt / scale:.2f} m")
+        else:
+            self.cursorInfo.emit(f"x {x_pt * 25.4 / 72:.0f} mm · y {y_pt * 25.4 / 72:.0f} mm")
+
+    # -- magnifier --------------------------------------------------------
+    LOUPE_SRC = 70       # half-size of the source square, in screen pixels
+    LOUPE_FACTOR = 2.5
+
+    def set_loupe(self, enabled: bool):
+        self.loupe_enabled = enabled
+        if not enabled and self._loupe is not None:
+            self._loupe.hide()
+
+    def _update_loupe(self, viewport_pos):
+        if self._loupe is None:
+            self._loupe = QLabel(None, Qt.ToolTip | Qt.FramelessWindowHint)
+            self._loupe.setStyleSheet("border: 2px solid #2f6fed; background: white;")
+        h = self.LOUPE_SRC
+        src = QRect(viewport_pos.x() - h, viewport_pos.y() - h, 2 * h, 2 * h)
+        grab = self.viewport().grab(src)
+        size = int(2 * h * self.LOUPE_FACTOR)
+        self._loupe.setPixmap(grab.scaled(size, size, Qt.KeepAspectRatio, Qt.SmoothTransformation))
+        self._loupe.resize(size + 4, size + 4)
+        gpos = self.viewport().mapToGlobal(viewport_pos)
+        self._loupe.move(gpos.x() + 24, gpos.y() + 24)
+        self._loupe.show()
+
+    def leaveEvent(self, event):
+        if self._loupe is not None:
+            self._loupe.hide()
+        self.cursorInfo.emit("")
+        super().leaveEvent(event)
+
+    # -- invert colours (dark plan reading) ----------------------------------
+    def set_invert(self, enabled: bool):
+        self.invert_colors = enabled
+        self.refresh_all()
+
+    # -- capture a zone to the clipboard -------------------------------------
+    def capture_to_clipboard(self, item: PageItem, p1, p2, factor: float = 2.0) -> QImage:
+        """Copies exactly what is displayed (page + annotations + measure
+        labels) inside the dragged rectangle, at ``factor`` x resolution."""
+        a = self._pdf_to_scene(item, p1)
+        b = self._pdf_to_scene(item, p2)
+        src = QRectF(a, b).normalized()
+        img = QImage(QSize(max(1, int(src.width() * factor)), max(1, int(src.height() * factor))),
+                     QImage.Format_ARGB32)
+        img.fill(QColor(255, 255, 255))
+        painter = QPainter(img)
+        painter.setRenderHint(QPainter.Antialiasing)
+        painter.setRenderHint(QPainter.SmoothPixmapTransform)
+        self._scene.render(painter, QRectF(0, 0, img.width(), img.height()), src)
+        painter.end()
+        QApplication.clipboard().setImage(img)
+        self.statusMessage.emit("Zone copiée dans le presse-papiers (Ctrl+V pour la coller).")
+        return img
+
+    # -- stamps ---------------------------------------------------------------
+    @staticmethod
+    def stamp_text(label: str) -> str:
+        today = datetime.date.today().strftime("%d/%m/%Y")
+        try:
+            user = getpass.getuser()
+        except Exception:
+            user = ""
+        return f"{label}\n{today}" + (f" – {user}" if user else "")
+
+    def place_stamp(self, page_no: int, pdf_pt, label: str | None = None):
+        label = label or self.stamp_label
+        text = self.stamp_text(label)
+        color = STAMP_COLORS.get(label, (0.85, 0.1, 0.1))
+        size = 14
+        longest = max(len(line) for line in text.split("\n"))
+        w = longest * size * 0.62 + 18
+        h = 2 * size * 1.3 + 10
+        rect = pymupdf.Rect(pdf_pt.x - w / 2, pdf_pt.y - h / 2, pdf_pt.x + w / 2, pdf_pt.y + h / 2)
+        self.doc.add_stamp(page_no, rect, text, color, size)
+        self._rebuild_page_annotations(self.page_items[page_no])
+        self.documentModified.emit()
+
+    # -- callouts -------------------------------------------------------------
+    def _create_callout(self, page_no: int, target, end, text: str | None = None):
+        if text is None:
+            text, ok = QInputDialog.getMultiLineText(self, "Légende", "Texte de la légende :")
+            if not ok or not text.strip():
+                return
+        size = 11
+        lines = text.split("\n")
+        w = max(len(line) for line in lines) * size * 0.58 + 12
+        h = len(lines) * size * 1.35 + 8
+        x0 = end.x if end.x >= target.x else end.x - w
+        box = pymupdf.Rect(x0, end.y - h / 2, x0 + w, end.y + h / 2)
+        self.doc.add_callout(page_no, target, box, text, self.current_color, size)
+
+    # -- keep other views of the same document in sync -------------------------
+    def rebuild_annotations(self):
+        for item in self.page_items:
+            self._rebuild_page_annotations(item)

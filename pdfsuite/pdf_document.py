@@ -10,24 +10,84 @@ from __future__ import annotations
 import pymupdf
 
 
+SCALE_KEY = "PDFSuiteScale"   # custom catalog key: plan scale (points per metre)
+GEOM_KEY = "PDFSuiteGeom"     # custom annot key: our own exact geometry
+
+# 1 metre of paper expressed in PDF points (72 pt per inch).
+POINTS_PER_PAPER_METER = 72 / 0.0254
+
+STAMP_COLORS = {
+    "APPROUVÉ": (0.0, 0.5, 0.15),
+    "BON POUR EXÉCUTION": (0.0, 0.5, 0.15),
+    "VU": (0.1, 0.35, 0.85),
+    "À REVOIR": (0.9, 0.5, 0.0),
+    "REFUSÉ": (0.85, 0.1, 0.1),
+}
+
+
 class PdfDocument:
-    def __init__(self, path: str | None = None, password: str | None = None):
+    def __init__(self, path: str | None = None, password: str | None = None,
+                 data: bytes | None = None, title: str | None = None):
         self.path: str | None = path
+        # The file the user opened. "Enregistrer" never writes to it.
+        self.original_path: str | None = path
+        self.title: str | None = title
         self.dirty: bool = False
-        self.doc: pymupdf.Document = pymupdf.open(path) if path else pymupdf.open()
+        if data is not None:
+            self.doc = pymupdf.open("pdf", data)
+            self.dirty = True
+        else:
+            self.doc = pymupdf.open(path) if path else pymupdf.open()
         if self.doc.needs_pass:
             if not password or not self.doc.authenticate(password):
                 raise PermissionError("password-required")
         self._page_cache: dict[int, pymupdf.Page] = {}
-        # Real-world scale of the plan, in PDF points per metre. Set once
-        # by calibrating a measurement tool, then reused for every
-        # subsequent measurement in this session.
-        self.scale_points_per_meter: float | None = None
+        # Real-world scale of the plan, in PDF points per metre. Read from
+        # the file when it was saved by PDF Suite, otherwise asked once.
+        self._scale: float | None = self._read_scale()
 
     def _invalidate_pages(self):
         self._page_cache = {}
 
     # -- measurement scale ----------------------------------------------
+    def _read_scale(self) -> float | None:
+        try:
+            kind, val = self.doc.xref_get_key(self.doc.pdf_catalog(), SCALE_KEY)
+            if kind in ("float", "int"):
+                v = float(val)
+                return v if v > 0 else None
+        except Exception:
+            pass
+        return None
+
+    @property
+    def scale_points_per_meter(self) -> float | None:
+        return self._scale
+
+    @scale_points_per_meter.setter
+    def scale_points_per_meter(self, value: float | None):
+        """Also written into the PDF so the scale survives a reopen."""
+        self._scale = value if value and value > 0 else None
+        try:
+            cat = self.doc.pdf_catalog()
+            self.doc.xref_set_key(cat, SCALE_KEY,
+                                  f"{self._scale:.6f}" if self._scale else "null")
+        except Exception:
+            pass
+        self.mark_dirty()
+
+    def set_ratio_scale(self, ratio: float):
+        """Plan drawn at 1:ratio (e.g. 50 for 1:50)."""
+        self.scale_points_per_meter = POINTS_PER_PAPER_METER / ratio
+
+    def scale_description(self) -> str:
+        if not self._scale:
+            return "Échelle : non définie"
+        ratio = POINTS_PER_PAPER_METER / self._scale
+        if abs(ratio - round(ratio)) < 0.05:
+            return f"Échelle 1:{round(ratio)}"
+        return f"Échelle 1:{ratio:.1f}"
+
     def points_to_meters(self, points: float) -> float | None:
         if not self.scale_points_per_meter:
             return None
@@ -81,10 +141,19 @@ class PdfDocument:
         return self.render_page(index, zoom)
 
     # -- save -----------------------------------------------------------
+    def is_original(self, path: str) -> bool:
+        import os
+        if not self.original_path:
+            return False
+        return os.path.normcase(os.path.abspath(path)) == os.path.normcase(
+            os.path.abspath(self.original_path))
+
     def save(self, path: str | None = None):
         target = path or self.path
         if not target:
             raise ValueError("no path given")
+        if self.is_original(target):
+            raise PermissionError("Le fichier d'origine n'est jamais écrasé.")
         self.doc.save(target, incremental=False, deflate=True, garbage=3)
         self.path = target
         self.dirty = False
@@ -204,18 +273,24 @@ class PdfDocument:
         return annot
 
     def add_rect(self, index: int, rect, color=(1, 0, 0), fill=None, width=1.5):
+        rect = pymupdf.Rect(rect).normalize()
         annot = self.page(index).add_rect_annot(rect)
         annot.set_colors(stroke=color, fill=fill)
         annot.set_border(width=width)
         annot.update()
+        # exact shape, so that moving it does not make it grow by the border
+        self.set_geom(annot, (rect.x0, rect.y0, rect.x1, rect.y1))
         self.mark_dirty()
         return annot
 
     def add_ellipse(self, index: int, rect, color=(1, 0, 0), fill=None, width=1.5):
+        rect = pymupdf.Rect(rect).normalize()
         annot = self.page(index).add_circle_annot(rect)
         annot.set_colors(stroke=color, fill=fill)
         annot.set_border(width=width)
         annot.update()
+        # exact shape, so that moving it does not make it grow by the border
+        self.set_geom(annot, (rect.x0, rect.y0, rect.x1, rect.y1))
         self.mark_dirty()
         return annot
 
@@ -271,18 +346,164 @@ class PdfDocument:
         self.delete_annot(index, old_annot)
         return self.add_measure_line(index, p1, p2, color, label)
 
-    def add_measure_polygon(self, index: int, points, color, label: str):
+    def add_measure_polygon(self, index: int, points, color, label: str,
+                            subject: str = "pdfsuite:measure_perimeter"):
         annot = self.page(index).add_polygon_annot(points)
-        annot.set_colors(stroke=color)
+        annot.set_colors(stroke=color, fill=color if subject.endswith("area") else None)
+        if subject.endswith("area"):
+            annot.set_opacity(0.35)
         annot.set_border(width=1.5)
-        annot.set_info(subject="pdfsuite:measure_perimeter", content=label)
+        annot.set_info(subject=subject, content=label)
         annot.update()
         self.mark_dirty()
         return annot
 
-    def update_measure_polygon(self, index: int, old_annot, points, color, label: str):
+    def update_measure_polygon(self, index: int, old_annot, points, color, label: str,
+                               subject: str = "pdfsuite:measure_perimeter"):
         self.delete_annot(index, old_annot)
-        return self.add_measure_polygon(index, points, color, label)
+        return self.add_measure_polygon(index, points, color, label, subject)
+
+    # -- custom geometry (exact shape we drew, independent of the
+    # -- annotation rectangle that the PDF library may enlarge) ----------
+    def set_geom(self, annot, values):
+        self.doc.xref_set_key(annot.xref, GEOM_KEY,
+                              "[" + " ".join(f"{v:.3f}" for v in values) + "]")
+
+    def get_geom(self, annot) -> list[float] | None:
+        try:
+            kind, val = self.doc.xref_get_key(annot.xref, GEOM_KEY)
+            if kind == "array":
+                return [float(x) for x in val.strip("[]").split()]
+        except Exception:
+            pass
+        return None
+
+    # -- review markup: cloud / arrow / callout / stamp -------------------
+    def add_cloud(self, index: int, rect, color, width=1.5):
+        rect = pymupdf.Rect(rect).normalize()
+        annot = self.page(index).add_rect_annot(rect)
+        annot.set_colors(stroke=color)
+        annot.set_border(width=width, clouds=2)
+        annot.set_info(subject="pdfsuite:cloud")
+        annot.update()
+        self.set_geom(annot, (rect.x0, rect.y0, rect.x1, rect.y1))
+        self.mark_dirty()
+        return annot
+
+    def update_cloud(self, index: int, old_annot, rect, color, width=1.5):
+        self.delete_annot(index, old_annot)
+        return self.add_cloud(index, rect, color, width)
+
+    def add_arrow(self, index: int, p1, p2, color, width=1.8):
+        annot = self.page(index).add_line_annot(p1, p2)
+        annot.set_colors(stroke=color, fill=color)
+        annot.set_border(width=width)
+        annot.set_line_ends(pymupdf.PDF_ANNOT_LE_NONE, pymupdf.PDF_ANNOT_LE_CLOSED_ARROW)
+        annot.set_info(subject="pdfsuite:arrow")
+        annot.update()
+        self.mark_dirty()
+        return annot
+
+    def update_arrow(self, index: int, old_annot, p1, p2, color, width=1.8):
+        self.delete_annot(index, old_annot)
+        return self.add_arrow(index, p1, p2, color, width)
+
+    def add_callout(self, index: int, target, box, text: str, color, fontsize=11):
+        """Text box with a leader line pointing at ``target``."""
+        box = pymupdf.Rect(box).normalize()
+        knee = pymupdf.Point(box.x0 if target.x < box.x0 else
+                             (box.x1 if target.x > box.x1 else (box.x0 + box.x1) / 2),
+                             (box.y0 + box.y1) / 2)
+        annot = self.page(index).add_freetext_annot(
+            box, text, fontsize=fontsize, text_color=color, border_width=1,
+            fill_color=(1, 1, 1), callout=(target, knee),
+            line_end=pymupdf.PDF_ANNOT_LE_OPEN_ARROW,
+        )
+        annot.set_info(subject="pdfsuite:callout", content=text)
+        annot.update()
+        self.set_geom(annot, (target.x, target.y, box.x0, box.y0, box.x1, box.y1, fontsize))
+        self.mark_dirty()
+        return annot
+
+    def update_callout(self, index: int, old_annot, target, box, text, color, fontsize=11):
+        self.delete_annot(index, old_annot)
+        return self.add_callout(index, target, box, text, color, fontsize)
+
+    def add_stamp(self, index: int, rect, text: str, color, fontsize=14):
+        rect = pymupdf.Rect(rect).normalize()
+        annot = self.page(index).add_freetext_annot(
+            rect, text, fontsize=fontsize, text_color=color, border_width=2.5,
+            align=pymupdf.TEXT_ALIGN_CENTER,
+        )
+        annot.set_info(subject="pdfsuite:stamp", content=text)
+        annot.update()
+        self.set_geom(annot, (rect.x0, rect.y0, rect.x1, rect.y1, fontsize))
+        self.mark_dirty()
+        return annot
+
+    def update_stamp(self, index: int, old_annot, rect, text, color, fontsize=14):
+        self.delete_annot(index, old_annot)
+        return self.add_stamp(index, rect, text, color, fontsize)
+
+    # -- measurement report ----------------------------------------------
+    def measurements(self) -> list[dict]:
+        """Every PDF Suite measurement of the document, with values
+        recomputed from the geometry using the current scale."""
+        import math
+        rows = []
+        scale = self.scale_points_per_meter
+        for i in range(self.page_count):
+            for annot in self.annotations(i):
+                subject = (annot.info or {}).get("subject", "")
+                if not subject.startswith("pdfsuite:measure_"):
+                    continue
+                pts = [pymupdf.Point(p) for p in (annot.vertices or [])]
+                if len(pts) < 2:
+                    continue
+                kind = subject.split("_", 1)[1]
+                if kind == "line":
+                    length = math.dist(pts[0], pts[1])
+                    area = None
+                else:
+                    n = len(pts)
+                    length = sum(math.dist(pts[k], pts[(k + 1) % n]) for k in range(n))
+                    area = abs(sum(pts[k].x * pts[(k + 1) % n].y - pts[(k + 1) % n].x * pts[k].y
+                                   for k in range(n))) / 2
+                rows.append({
+                    "page": i + 1,
+                    "type": {"line": "Longueur", "perimeter": "Périmètre",
+                             "area": "Surface"}.get(kind, kind),
+                    "length_m": length / scale if scale else None,
+                    "area_m2": area / (scale * scale) if (scale and area is not None) else None,
+                    "label": (annot.info or {}).get("content", ""),
+                })
+        return rows
+
+    def export_measurements_csv(self, out_path: str) -> int:
+        """CSV readable by a French Excel (';' separator, ',' decimals)."""
+        import csv
+
+        def num(v):
+            return "" if v is None else f"{v:.3f}".replace(".", ",")
+
+        rows = self.measurements()
+        with open(out_path, "w", newline="", encoding="utf-8-sig") as f:
+            w = csv.writer(f, delimiter=";")
+            w.writerow(["N°", "Page", "Type", "Longueur / périmètre (m)", "Surface (m²)"])
+            for n, r in enumerate(rows, start=1):
+                w.writerow([n, r["page"], r["type"], num(r["length_m"]), num(r["area_m2"])])
+            if rows:
+                total_len = sum(r["length_m"] or 0 for r in rows if r["type"] == "Longueur")
+                total_area = sum(r["area_m2"] or 0 for r in rows if r["area_m2"] is not None)
+                w.writerow([])
+                w.writerow(["", "", "Total longueurs", num(total_len), ""])
+                w.writerow(["", "", "Total surfaces", "", num(total_area)])
+        return len(rows)
+
+    # -- capture --------------------------------------------------------
+    def render_clip(self, index: int, rect, dpi: int = 200) -> pymupdf.Pixmap:
+        """High-resolution render of part of a page, annotations included."""
+        return self.page(index).get_pixmap(dpi=dpi, clip=pymupdf.Rect(rect), annots=True)
 
     def delete_annot_at(self, index: int, point) -> bool:
         page = self.page(index)
@@ -348,6 +569,8 @@ class PdfDocument:
         self.mark_dirty()
 
     def save_with_pending_encryption(self, path: str):
+        if self.is_original(path):
+            raise PermissionError("Le fichier d'origine n'est jamais écrasé.")
         kwargs = getattr(self, "_pending_encrypt", None)
         if kwargs:
             self.doc.save(path, deflate=True, garbage=3, **kwargs)

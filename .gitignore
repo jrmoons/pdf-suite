@@ -3,6 +3,7 @@ __pycache__/
 *.pyc
 .smoke/*.pdf
 .smoke/*.png
+.smoke/*.csv
 build/
 dist/
 *.spec

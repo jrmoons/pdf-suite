@@ -18,15 +18,23 @@ class Tool(Enum):
     SIGNATURE = auto()
     MEASURE_LINE = auto()
     MEASURE_PERIMETER = auto()
+    MEASURE_AREA = auto()
+    ARROW = auto()
+    CLOUD = auto()
+    CALLOUT = auto()
+    STAMP = auto()
+    CAPTURE = auto()
 
 
 DRAG_TOOLS = {Tool.HIGHLIGHT, Tool.UNDERLINE, Tool.STRIKEOUT, Tool.RECT,
-              Tool.ELLIPSE, Tool.LINE, Tool.INK, Tool.MEASURE_LINE}
+              Tool.ELLIPSE, Tool.LINE, Tool.INK, Tool.MEASURE_LINE,
+              Tool.ARROW, Tool.CLOUD, Tool.CALLOUT, Tool.CAPTURE}
 
-CLICK_TOOLS = {Tool.FREETEXT, Tool.NOTE, Tool.ERASER, Tool.TEXTEDIT, Tool.SIGNATURE}
+CLICK_TOOLS = {Tool.FREETEXT, Tool.NOTE, Tool.ERASER, Tool.TEXTEDIT, Tool.SIGNATURE,
+               Tool.STAMP}
 
 # Tools handled with their own multi-click state machine (not a simple drag).
-POLY_TOOLS = {Tool.MEASURE_PERIMETER}
+POLY_TOOLS = {Tool.MEASURE_PERIMETER, Tool.MEASURE_AREA}
 
 DEFAULT_COLOR = {
     Tool.HIGHLIGHT: (1.0, 0.85, 0.2),
@@ -39,4 +47,5 @@ DEFAULT_COLOR = {
     Tool.FREETEXT: (0.0, 0.0, 0.0),
     Tool.MEASURE_LINE: (0.0, 0.55, 0.9),
     Tool.MEASURE_PERIMETER: (0.0, 0.55, 0.9),
+    Tool.MEASURE_AREA: (0.0, 0.55, 0.9),
 }

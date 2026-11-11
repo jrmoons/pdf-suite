@@ -119,7 +119,9 @@ class ShapeItem(QGraphicsObject):
         pad = max(self.width, 4.0)
         if self.kind in ("rect", "ellipse"):
             return QRectF(self.geometry).normalized().adjusted(-pad, -pad, pad, pad)
-        if self.kind == "line":
+        if self.kind == "cloud":
+            return QRectF(self.geometry).normalized().adjusted(-12, -12, 12, 12)
+        if self.kind in ("line", "arrow"):
             p1, p2 = self.geometry
             return QRectF(p1, p2).normalized().adjusted(-pad, -pad, pad, pad)
         # ink: bounding box of every point in every stroke
@@ -142,6 +144,14 @@ class ShapeItem(QGraphicsObject):
             painter.drawEllipse(QRectF(self.geometry).normalized())
         elif self.kind == "line":
             painter.drawLine(*self.geometry)
+        elif self.kind == "arrow":
+            p1, p2 = self.geometry
+            painter.drawLine(p1, p2)
+            painter.setBrush(QBrush(_qcolor(self.color_tuple)))
+            painter.drawPolygon(_arrow_head(p1, p2, 4 + self.width * 3))
+        elif self.kind == "cloud":
+            painter.setBrush(Qt.NoBrush)
+            painter.drawPath(cloud_path(QRectF(self.geometry).normalized()))
         elif self.kind == "ink":
             for stroke in self.geometry:
                 if len(stroke) < 2:
@@ -173,9 +183,9 @@ class ShapeItem(QGraphicsObject):
         self.update()
 
     def _apply_delta(self, d: QPointF):
-        if self.kind in ("rect", "ellipse"):
+        if self.kind in ("rect", "ellipse", "cloud"):
             self.geometry = QRectF(self.geometry).translated(d)
-        elif self.kind == "line":
+        elif self.kind in ("line", "arrow"):
             p1, p2 = self.geometry
             self.geometry = (p1 + d, p2 + d)
         elif self.kind == "ink":
@@ -192,6 +202,15 @@ class ShapeItem(QGraphicsObject):
             pdf_rect = _rect_to_pdf(self.geometry, page)
             self.annot = doc.update_ellipse(self.page_no, self.annot, pdf_rect,
                                              self.color_tuple, self.fill_tuple, self.width)
+        elif self.kind == "cloud":
+            pdf_rect = _rect_to_pdf(self.geometry, page)
+            self.annot = doc.update_cloud(self.page_no, self.annot, pdf_rect,
+                                           self.color_tuple, self.width)
+        elif self.kind == "arrow":
+            p1, p2 = self.geometry
+            self.annot = doc.update_arrow(self.page_no, self.annot,
+                                           to_pdf(p1, page), to_pdf(p2, page),
+                                           self.color_tuple, self.width)
         elif self.kind == "line":
             p1, p2 = self.geometry
             self.annot = doc.update_line(self.page_no, self.annot,
@@ -218,6 +237,38 @@ class ShapeItem(QGraphicsObject):
         menu = _build_menu(self.view, self.locked, toggle_lock, delete)
         menu.exec(event.screenPos())
         event.accept()
+
+
+def _arrow_head(p1: QPointF, p2: QPointF, size: float):
+    from PySide6.QtGui import QPolygonF
+    dx, dy = p2.x() - p1.x(), p2.y() - p1.y()
+    length = math.hypot(dx, dy) or 1.0
+    ux, uy = dx / length, dy / length
+    base = QPointF(p2.x() - ux * size, p2.y() - uy * size)
+    nx, ny = -uy * size * 0.45, ux * size * 0.45
+    return QPolygonF([p2, QPointF(base.x() + nx, base.y() + ny),
+                      QPointF(base.x() - nx, base.y() - ny)])
+
+
+def cloud_path(r: QRectF, bump: float = 9.0) -> QPainterPath:
+    """Revision-cloud outline: small outward arcs all around ``r``."""
+    corners = [r.topLeft(), r.topRight(), r.bottomRight(), r.bottomLeft()]
+    path = QPainterPath(corners[0])
+    for i in range(4):
+        a, b = corners[i], corners[(i + 1) % 4]
+        dx, dy = b.x() - a.x(), b.y() - a.y()
+        length = math.hypot(dx, dy)
+        if length < 1e-6:
+            continue
+        n = max(1, round(length / bump))
+        # outward normal (corners go clockwise on screen)
+        nx, ny = dy / length, -dx / length
+        for k in range(n):
+            s1 = QPointF(a.x() + dx * (k + 1) / n, a.y() + dy * (k + 1) / n)
+            mid = QPointF(a.x() + dx * (k + 0.5) / n + nx * bump * 0.9,
+                          a.y() + dy * (k + 0.5) / n + ny * bump * 0.9)
+            path.quadTo(mid, s1)
+    return path
 
 
 def _rect_to_pdf(rect: QRectF, page) -> "pymupdf.Rect":
@@ -488,6 +539,12 @@ class MeasureLineItem(MeasureItemBase):
 
 
 class MeasurePolygonItem(MeasureItemBase):
+    subject = "pdfsuite:measure_perimeter"
+
+    @property
+    def is_area(self) -> bool:
+        return self.subject.endswith("area")
+
     def _compute_label(self) -> str:
         perimeter_pts = _polygon_perimeter(self.points)
         area_pts2 = _polygon_area(self.points)
@@ -497,6 +554,8 @@ class MeasurePolygonItem(MeasureItemBase):
             return "?"
         scale = doc.scale_points_per_meter
         area_m2 = area_pts2 / (scale * scale) if scale else 0.0
+        if self.is_area:
+            return f"Surface {doc.format_area(area_m2)}"
         return f"Périmètre {doc.format_length(meters)} · Surface {doc.format_area(area_m2)}"
 
     def boundingRect(self) -> QRectF:
@@ -513,7 +572,7 @@ class MeasurePolygonItem(MeasureItemBase):
         pen = QPen(self.color, 1.4, Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin)
         painter.setPen(pen)
         fill = QColor(self.color)
-        fill.setAlphaF(0.12)
+        fill.setAlphaF(0.30 if self.is_area else 0.12)
         painter.setBrush(QBrush(fill))
         path = QPainterPath(self.points[0])
         for pt in self.points[1:]:
@@ -542,6 +601,7 @@ class MeasurePolygonItem(MeasureItemBase):
         pdf_points = [to_pdf(p, page) for p in self.points]
         self.annot = self.view.doc.update_measure_polygon(
             self.page_no, self.annot, pdf_points, self.color_tuple, self.label,
+            self.subject,
         )
         self.view.documentModified.emit()
 
@@ -564,9 +624,172 @@ def _polygon_area(points: list[QPointF]) -> float:
     return abs(s) / 2.0
 
 
+class _MovableTextBase(QGraphicsObject):
+    """Stamp / callout: whole-item drag, lock and delete."""
+
+    def __init__(self, view, page_no, annot, color, text, fontsize):
+        super().__init__()
+        self.view = view
+        self.page_no = page_no
+        self.annot = annot
+        self.color_tuple = tuple(color)
+        self.color = _qcolor(color)
+        self.text = text
+        self.fontsize = fontsize
+        self.locked = False
+        self.setScale(view.zoom)
+        self.setZValue(9)
+        self.setFlag(QGraphicsItem.ItemIsSelectable, True)
+        self.setFlag(QGraphicsItem.ItemIsMovable, True)
+        self.setCursor(Qt.SizeAllCursor)
+
+    def _font(self) -> QFont:
+        f = QFont("Arial")
+        f.setPixelSize(max(1, round(self.fontsize)))
+        return f
+
+    def mouseReleaseEvent(self, event):
+        super().mouseReleaseEvent(event)
+        if self.locked:
+            return
+        delta = self.pos()
+        if abs(delta.x()) < 0.01 and abs(delta.y()) < 0.01:
+            return
+        zoom = self.scale() or 1.0
+        self.prepareGeometryChange()
+        self._translate(QPointF(delta.x() / zoom, delta.y() / zoom))
+        self.setPos(0, 0)
+        self._sync_to_pdf()
+        self.update()
+
+    def contextMenuEvent(self, event):
+        def toggle_lock():
+            self.locked = not self.locked
+            self.setFlag(QGraphicsItem.ItemIsMovable, not self.locked)
+            for h in getattr(self, "handles", []):
+                h.set_locked(self.locked)
+
+        def delete():
+            self.view.doc.delete_annot(self.page_no, self.annot)
+            self.view.remove_annotation_item(self.page_no, self)
+            for h in getattr(self, "handles", []):
+                if h.scene():
+                    h.scene().removeItem(h)
+            self.view.documentModified.emit()
+
+        menu = _build_menu(self.view, self.locked, toggle_lock, delete)
+        menu.exec(event.screenPos())
+        event.accept()
+
+
+class StampItem(_MovableTextBase):
+    def __init__(self, view, page_no, annot, rect: QRectF, text, color, fontsize=14):
+        super().__init__(view, page_no, annot, color, text, fontsize)
+        self.rect = rect
+
+    def boundingRect(self) -> QRectF:
+        return QRectF(self.rect).adjusted(-3, -3, 3, 3)
+
+    def paint(self, painter, option, widget=None):
+        painter.setPen(QPen(self.color, 2.5))
+        painter.setBrush(Qt.NoBrush)
+        painter.drawRoundedRect(self.rect, 3, 3)
+        painter.setFont(self._font())
+        painter.drawText(self.rect, Qt.AlignCenter, self.text)
+        if self.isSelected():
+            painter.setPen(QPen(QColor(47, 111, 237), 1, Qt.DashLine))
+            painter.drawRect(self.boundingRect())
+
+    def _translate(self, d: QPointF):
+        self.rect = QRectF(self.rect).translated(d)
+
+    def _sync_to_pdf(self):
+        page = self.view.doc.page(self.page_no)
+        self.annot = self.view.doc.update_stamp(
+            self.page_no, self.annot, _rect_to_pdf(self.rect, page),
+            self.text, self.color_tuple, self.fontsize)
+        self.view.documentModified.emit()
+
+
+class CalloutItem(_MovableTextBase):
+    """Text box + leader line; the arrow tip has its own draggable handle."""
+
+    def __init__(self, view, page_no, annot, target: QPointF, box: QRectF, text, color,
+                 fontsize=11):
+        super().__init__(view, page_no, annot, color, text, fontsize)
+        self.target = target
+        self.box = box
+        self.handles: list[VertexHandle] = []
+
+    # -- VertexHandle protocol (owner.color / handle_moving / handle_released)
+    def make_handles(self, page_item):
+        h = VertexHandle(self, 0, parent=page_item)
+        h.setPos(self.target.x() * self.view.zoom, self.target.y() * self.view.zoom)
+        self.handles = [h]
+        return self.handles
+
+    def handle_moving(self, index, new_pixel_pos: QPointF):
+        zoom = self.view.zoom or 1.0
+        self.prepareGeometryChange()
+        self.target = QPointF(new_pixel_pos.x() / zoom, new_pixel_pos.y() / zoom)
+        self.update()
+
+    def handle_released(self):
+        self._sync_to_pdf()
+
+    def _knee(self) -> QPointF:
+        b = self.box
+        x = b.left() if self.target.x() < b.left() else (
+            b.right() if self.target.x() > b.right() else b.center().x())
+        return QPointF(x, b.center().y())
+
+    def boundingRect(self) -> QRectF:
+        r = QRectF(self.box).united(QRectF(self.target, self.target))
+        return r.adjusted(-8, -8, 8, 8)
+
+    def paint(self, painter, option, widget=None):
+        painter.setPen(QPen(self.color, 1.2))
+        knee = self._knee()
+        painter.drawLine(knee, self.target)
+        painter.setBrush(QBrush(self.color))
+        painter.drawPolygon(_arrow_head(knee, self.target, 7))
+        painter.setBrush(QBrush(QColor(255, 255, 255)))
+        painter.drawRect(self.box)
+        painter.setFont(self._font())
+        painter.drawText(self.box.adjusted(3, 2, -3, -2), Qt.TextWordWrap, self.text)
+        if self.isSelected():
+            painter.setBrush(Qt.NoBrush)
+            painter.setPen(QPen(QColor(47, 111, 237), 1, Qt.DashLine))
+            painter.drawRect(self.boundingRect())
+
+    def _translate(self, d: QPointF):
+        self.box = QRectF(self.box).translated(d)
+        self.target = self.target + d
+        for h in self.handles:
+            h.setPos(self.target.x() * self.view.zoom, self.target.y() * self.view.zoom)
+
+    def _sync_to_pdf(self):
+        page = self.view.doc.page(self.page_no)
+        self.annot = self.view.doc.update_callout(
+            self.page_no, self.annot, to_pdf(self.target, page),
+            _rect_to_pdf(self.box, page), self.text, self.color_tuple, self.fontsize)
+        self.view.documentModified.emit()
+
+
 # -- reconstruction from an existing PyMuPDF annotation ---------------------
+def _freetext_color(doc, annot):
+    """Text colour of a FreeText annotation (stored in its /DA string)."""
+    try:
+        kind, da = doc.doc.xref_get_key(annot.xref, "DA")
+        nums = da.split(" rg")[0].split()[-3:]
+        return tuple(float(x) for x in nums)
+    except Exception:
+        return None
+
+
 def build_item_for_annot(view, page, page_no: int, annot):
     """Create the Qt vector item(s) matching an existing PyMuPDF annotation."""
+    import pymupdf
     kind = annot.type[1]
     subject = (annot.info or {}).get("subject", "")
     color = tuple(annot.colors.get("stroke") or (0, 0, 0))
@@ -586,13 +809,24 @@ def build_item_for_annot(view, page, page_no: int, annot):
         kmap = {"Highlight": "highlight", "Underline": "underline", "StrikeOut": "strikeout"}
         return [MarkupItem(view, page_no, annot, kmap[kind], quads, color)]
 
+    doc = view.doc
+
+    if kind == "Square" and subject == "pdfsuite:cloud":
+        g = doc.get_geom(annot)
+        rect = pymupdf.Rect(g[:4]) if g and len(g) >= 4 else annot.rect
+        r = to_visual_rect(rect, page)
+        return [ShapeItem(view, page_no, annot, "cloud", r, color, None,
+                          annot.border.get("width") or 1.5)]
+
     if kind == "Square":
-        r = to_visual_rect(annot.rect, page)
+        g = doc.get_geom(annot)
+        r = to_visual_rect(pymupdf.Rect(g[:4]) if g and len(g) >= 4 else annot.rect, page)
         fill = tuple(annot.colors.get("fill")) if annot.colors.get("fill") else None
         return [ShapeItem(view, page_no, annot, "rect", r, color, fill, annot.border.get("width") or 1.5)]
 
     if kind == "Circle":
-        r = to_visual_rect(annot.rect, page)
+        g = doc.get_geom(annot)
+        r = to_visual_rect(pymupdf.Rect(g[:4]) if g and len(g) >= 4 else annot.rect, page)
         fill = tuple(annot.colors.get("fill")) if annot.colors.get("fill") else None
         return [ShapeItem(view, page_no, annot, "ellipse", r, color, fill, annot.border.get("width") or 1.5)]
 
@@ -605,7 +839,12 @@ def build_item_for_annot(view, page, page_no: int, annot):
         if subject == "pdfsuite:measure_line":
             label = (annot.info or {}).get("content", "")
             item = MeasureLineItem(view, page_no, annot, [p1, p2], color, label)
+            if doc.scale_points_per_meter:
+                item.label = item._compute_label()
             return [item]
+        if subject == "pdfsuite:arrow":
+            return [ShapeItem(view, page_no, annot, "arrow", (p1, p2), color, None,
+                              annot.border.get("width") or 1.8)]
         return [ShapeItem(view, page_no, annot, "line", (p1, p2), color, None,
                            annot.border.get("width") or 1.5)]
 
@@ -618,13 +857,37 @@ def build_item_for_annot(view, page, page_no: int, annot):
         return [ShapeItem(view, page_no, annot, "ink", strokes, color, None,
                            annot.border.get("width") or 2.0)]
 
-    if kind == "Polygon" and subject == "pdfsuite:measure_perimeter":
+    if kind == "Polygon" and subject in ("pdfsuite:measure_perimeter", "pdfsuite:measure_area"):
         verts = annot.vertices or []
         points = [to_visual(pt, page) for pt in verts]
         if len(points) < 3:
             return []
         label = (annot.info or {}).get("content", "")
-        return [MeasurePolygonItem(view, page_no, annot, points, color, label)]
+        item = MeasurePolygonItem(view, page_no, annot, points, color, label)
+        item.subject = subject
+        if doc.scale_points_per_meter:
+            item.label = item._compute_label()
+        return [item]
+
+    if kind == "FreeText" and subject in ("pdfsuite:stamp", "pdfsuite:callout"):
+        text = (annot.info or {}).get("content", "")
+        g = doc.get_geom(annot)
+        tcolor = _freetext_color(doc, annot) or (0, 0, 0)
+        if subject == "pdfsuite:stamp":
+            rect = pymupdf.Rect(g[:4]) if g and len(g) >= 4 else annot.rect
+            size = g[4] if g and len(g) >= 5 else 14
+            return [StampItem(view, page_no, annot, to_visual_rect(rect, page), text, tcolor, size)]
+        if g and len(g) >= 6:
+            target = pymupdf.Point(g[0], g[1])
+            box = pymupdf.Rect(g[2:6])
+            size = g[6] if len(g) >= 7 else 11
+        else:
+            verts = annot.vertices or [(annot.rect.x0, annot.rect.y0)]
+            target = pymupdf.Point(verts[0])
+            box = annot.rect
+            size = 11
+        return [CalloutItem(view, page_no, annot, to_visual(target, page),
+                            to_visual_rect(box, page), text, tcolor, size)]
 
     if kind == "FreeText":
         r = to_visual_rect(annot.rect, page)

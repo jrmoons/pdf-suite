@@ -21,51 +21,54 @@ Double-cliquer sur `creer_raccourci.bat` : construit `dist\PDFSuite.exe`
 L'exe est aussi construit automatiquement par GitHub Actions à chaque push
 (onglet Actions → artefact `PDFSuite-windows`).
 
-## Fonctionnalités actuelles (V1)
+## Interface
 
-- **Visionneuse** : ouverture multi-documents par onglets, défilement continu,
-  zoom, panneau de vignettes (réorganisation par glisser-déposer).
-- **Annotations vectorielles** : rectangle, ellipse, ligne, dessin à main
-  levée restent des objets vectoriels déplaçables (outil « Sélectionner »,
-  glisser pour repositionner) — clic droit dessus → Verrouiller/Déverrouiller
-  la position ou Supprimer. Surligner, souligner, barrer, texte libre, note
-  collante, gomme sont aussi disponibles (affichage + suppression).
-- **Mesures** : outils « Mesurer une ligne » et « Périmètre » (clic à chaque
-  coin de la pièce, clic droit ou Entrée pour terminer, Échap pour annuler).
-  La première mesure demande l'échelle réelle du plan (longueur réelle
-  représentée), puis elle est réutilisée automatiquement — « Réinitialiser
-  l'échelle » dans la barre d'outils pour la redéfinir. Chaque mesure garde
-  ses poignées de coin déplaçables pour recadrer la pièce si besoin.
-- **Pages** : insérer une page vierge, supprimer, faire pivoter, réordonner
-  (glisser les vignettes), insérer un autre PDF, extraire des pages vers un
-  nouveau fichier, diviser un document en plusieurs fichiers.
-- **Édition de texte** : outil « Modifier texte », clic sur un bloc de texte
-  existant → boîte de dialogue d'édition (remplace le texte en place via
-  rédaction + réinsertion, taille de police ajustable).
-- **Formulaires** : mode « Formulaire » qui superpose des champs interactifs
-  (texte, case à cocher, liste) sur les champs AcroForm du PDF.
-- **Signature** : dessiner une signature à la souris et la déposer sur la page.
-- **Sécurité** : ajout d'un mot de passe (chiffrement AES-256) à
-  l'enregistrement ; ouverture de PDF déjà protégés par mot de passe.
-- **Interface** : thème clair / sombre (bouton dans la barre d'outils ou menu
-  Affichage, préférence mémorisée entre les lancements), barre d'outils avec
-  icônes au-dessus du texte, zoom Ctrl + molette centré
-  sur le curseur.
+Ruban à onglets : **Accueil · Commentaires · Mesures · Pages · Protéger ·
+Affichage** (l'onglet affiché est mémorisé). Un outil reste actif après usage
+pour enchaîner les annotations / mesures ; **Échap** revient à « Sélectionner ».
 
-## Limitations connues / à améliorer ensuite
+**Enregistrer (Ctrl+S) = toujours « Enregistrer sous »** : le fichier ouvert
+n'est jamais écrasé (nom proposé : `…_modifié.pdf`).
 
-- Pas d'undo/redo pour l'instant.
-- L'édition de texte fonctionne bloc par bloc (police approximative, pas
-  d'édition caractère par caractère avec la police d'origine garantie).
-- Texte libre et note ne sont pas encore déplaçables (juste supprimables) —
-  seuls rectangle/ellipse/ligne/dessin/mesures le sont.
-- L'échelle du plan n'est mémorisée que pour la session en cours (pas encore
-  écrite dans le fichier PDF).
-- Pas encore de : OCR, conversion PDF ↔ Word/Excel/Image, impression,
-  recherche de texte plein document, sélection/copie de texte libre,
-  compression avancée, comparaison de documents.
+## Fonctionnalités
 
-Dis-moi quelles fonctionnalités ajouter en priorité et je les intègre.
+- **Visionneuse** : multi-onglets, défilement continu, zoom (Ctrl + molette
+  centré sur le curseur), vignettes réorganisables, thème clair / sombre.
+- **Commentaires** : surligner, souligner, barrer, texte libre, note, dessin,
+  rectangle, ellipse, ligne, **flèche**, **nuage de révision**, **légende**
+  (texte + trait vers le point visé, pointe déplaçable), **tampons de chantier**
+  (APPROUVÉ, BON POUR EXÉCUTION, VU, À REVOIR, REFUSÉ ou texte personnalisé,
+  avec la date du jour et le nom Windows), gomme, couleur.
+  Les formes, flèches, nuages, légendes et tampons sont des objets vectoriels
+  déplaçables (clic droit → Verrouiller / Supprimer).
+- **Mesures (plans)** :
+  - Longueur, Périmètre, **Surface (m²)** ;
+  - **Échelle** : préréglages 1:20, 1:50, 1:100, 1:200… ou calibrage sur une
+    ligne de longueur connue ; l'échelle est **enregistrée dans le PDF** et
+    retrouvée à la réouverture ;
+  - **Grille** (pas en mètres quand l'échelle est connue) + **Aimanter** ;
+    coordonnées du curseur en bas à droite ;
+  - **Exporter mesures** : toutes les mesures vers un CSV qui s'ouvre dans
+    Excel (totaux inclus) ;
+  - **Comparer** deux versions d'un plan : rouge = supprimé, vert = ajouté
+    (les deux plans doivent avoir la même mise en page) ;
+  - **Capture** : copie une zone (avec les cotes) dans le presse-papiers.
+- **Affichage** : **loupe** qui suit la souris, **inverser les couleurs**
+  (page sombre), **vue fractionnée** (deux vues du même document).
+- **Pages** : insérer une page vierge, supprimer, pivoter, réordonner,
+  insérer un PDF, extraire, diviser.
+- **Édition de texte** bloc par bloc, **formulaires** AcroForm,
+  **signature** dessinée.
+- **Protéger** : mot de passe AES-256 ; ouverture de PDF protégés.
+
+## Limitations connues / à venir
+
+- Pas encore d'annuler / refaire (prochain lot).
+- Texte libre et note : pas encore déplaçables.
+- Comparaison : pas de recalage automatique (plans supposés superposables).
+- Lots suivants prévus : indispensables (annuler/refaire, combiner, compresser,
+  recherche, impression, filigrane, numérotation…), organisation des pages,
+  OCR, conversion PDF → Word / Excel, signets, commentaires, etc.
 
 ## Développement
 
@@ -75,4 +78,6 @@ python -m venv .venv
 .venv\Scripts\python -m pdfsuite.main
 ```
 
-Tests de fumée (rendu hors écran, sans interface visible) dans `.smoke/`.
+Tests de fumée (rendu hors écran, sans interface visible) dans `.smoke/` :
+`set QT_QPA_PLATFORM=offscreen` puis `.venv\Scripts\python .smokeun_smoke7.py`
+(lancer `make_sample.py` d'abord pour les tests 1 à 6).

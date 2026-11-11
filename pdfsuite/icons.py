@@ -350,6 +350,144 @@ _DRAWERS = {
 }
 
 
+# -- icons added with the "plans / chantier" batch ---------------------------
+def _draw_arrow(p: QPainter, r: QRectF, c: QColor):
+    a, b = QPointF(r.left() + 5, r.bottom() - 5), QPointF(r.right() - 5, r.top() + 5)
+    p.drawLine(a, b)
+    p.setBrush(c)
+    from PySide6.QtGui import QPolygonF
+    p.drawPolygon(QPolygonF([b, QPointF(b.x() - 9, b.y() + 2), QPointF(b.x() - 2, b.y() + 9)]))
+
+
+def _draw_cloud(p: QPainter, r: QRectF, c: QColor):
+    from .annotation_items import cloud_path
+    p.drawPath(cloud_path(r.adjusted(7, 8, -7, -8), bump=4.5))
+
+
+def _draw_callout(p: QPainter, r: QRectF, c: QColor):
+    box = QRectF(r.left() + 10, r.top() + 4, r.width() - 14, 11)
+    p.drawRect(box)
+    p.drawLine(QPointF(box.left(), box.center().y()), QPointF(r.left() + 4, r.bottom() - 4))
+    p.drawLine(QPointF(box.left() + 3, box.center().y()), QPointF(box.right() - 3, box.center().y()))
+
+
+def _draw_stamp(p: QPainter, r: QRectF, c: QColor):
+    p.drawRoundedRect(QRectF(r.left() + 3, r.top() + 7, r.width() - 6, r.height() - 14), 2, 2)
+    f = QFont()
+    f.setBold(True)
+    f.setPixelSize(8)
+    p.setFont(f)
+    p.drawText(r, Qt.AlignCenter, "OK")
+
+
+def _draw_measure_area(p: QPainter, r: QRectF, c: QColor):
+    from PySide6.QtGui import QPolygonF
+    fill = QColor(c)
+    fill.setAlpha(80)
+    p.setBrush(fill)
+    p.drawPolygon(QPolygonF([QPointF(r.left() + 4, r.top() + 8), QPointF(r.right() - 6, r.top() + 4),
+                             QPointF(r.right() - 4, r.bottom() - 6), QPointF(r.left() + 8, r.bottom() - 4)]))
+    f = QFont()
+    f.setPixelSize(8)
+    p.setFont(f)
+    p.drawText(r, Qt.AlignCenter, "m²")
+
+
+def _draw_scale(p: QPainter, r: QRectF, c: QColor):
+    y = r.center().y() + 3
+    p.drawLine(QPointF(r.left() + 3, y), QPointF(r.right() - 3, y))
+    for i in range(5):
+        x = r.left() + 3 + i * (r.width() - 6) / 4
+        p.drawLine(QPointF(x, y), QPointF(x, y - (6 if i % 2 == 0 else 3)))
+    f = QFont()
+    f.setPixelSize(8)
+    p.setFont(f)
+    p.drawText(QRectF(r.left(), r.top() + 2, r.width(), 10), Qt.AlignCenter, "1:50")
+
+
+def _draw_export(p: QPainter, r: QRectF, c: QColor):
+    p.drawRect(QRectF(r.left() + 4, r.top() + 4, 14, 20))
+    for i in range(3):
+        y = r.top() + 10 + i * 5
+        p.drawLine(QPointF(r.left() + 7, y), QPointF(r.left() + 15, y))
+    p.drawLine(QPointF(r.left() + 14, r.center().y()), QPointF(r.right() - 3, r.center().y()))
+    p.drawLine(QPointF(r.right() - 3, r.center().y()), QPointF(r.right() - 7, r.center().y() - 4))
+    p.drawLine(QPointF(r.right() - 3, r.center().y()), QPointF(r.right() - 7, r.center().y() + 4))
+
+
+def _draw_compare(p: QPainter, r: QRectF, c: QColor):
+    p.setPen(QPen(QColor(220, 30, 30), 1.8))
+    p.drawRect(QRectF(r.left() + 3, r.top() + 4, 14, 17))
+    p.setPen(QPen(QColor(0, 160, 60), 1.8))
+    p.drawRect(QRectF(r.left() + 10, r.top() + 8, 14, 17))
+
+
+def _draw_grid(p: QPainter, r: QRectF, c: QColor):
+    for i in range(4):
+        x = r.left() + 4 + i * (r.width() - 8) / 3
+        y = r.top() + 4 + i * (r.height() - 8) / 3
+        p.drawLine(QPointF(x, r.top() + 4), QPointF(x, r.bottom() - 4))
+        p.drawLine(QPointF(r.left() + 4, y), QPointF(r.right() - 4, y))
+
+
+def _draw_snap(p: QPainter, r: QRectF, c: QColor):
+    _draw_grid(p, r, c)
+    p.setBrush(c)
+    p.drawEllipse(QPointF(r.left() + 4 + (r.width() - 8) / 3, r.top() + 4 + (r.height() - 8) / 3), 3.2, 3.2)
+
+
+def _draw_loupe(p: QPainter, r: QRectF, c: QColor):
+    p.drawEllipse(QPointF(r.left() + 11, r.top() + 11), 7.5, 7.5)
+    pen = p.pen()
+    pen.setWidthF(3)
+    p.setPen(pen)
+    p.drawLine(QPointF(r.left() + 17, r.top() + 17), QPointF(r.right() - 4, r.bottom() - 4))
+
+
+def _draw_invert(p: QPainter, r: QRectF, c: QColor):
+    p.drawEllipse(r.center(), 9, 9)
+    path = QPainterPath()
+    path.moveTo(r.center().x(), r.center().y() - 9)
+    path.arcTo(QRectF(r.center().x() - 9, r.center().y() - 9, 18, 18), 90, 180)
+    path.closeSubpath()
+    p.setBrush(c)
+    p.drawPath(path)
+
+
+def _draw_splitview(p: QPainter, r: QRectF, c: QColor):
+    p.drawRect(QRectF(r.left() + 3, r.top() + 5, r.width() - 6, r.height() - 10))
+    p.drawLine(QPointF(r.center().x(), r.top() + 5), QPointF(r.center().x(), r.bottom() - 5))
+
+
+def _draw_capture(p: QPainter, r: QRectF, c: QColor):
+    pen = p.pen()
+    pen.setStyle(Qt.DashLine)
+    p.setPen(pen)
+    p.drawRect(QRectF(r.left() + 4, r.top() + 4, r.width() - 8, r.height() - 8))
+    pen.setStyle(Qt.SolidLine)
+    p.setPen(pen)
+    p.drawLine(QPointF(r.center().x(), r.center().y() - 4), QPointF(r.center().x(), r.center().y() + 4))
+    p.drawLine(QPointF(r.center().x() - 4, r.center().y()), QPointF(r.center().x() + 4, r.center().y()))
+
+
+_DRAWERS.update({
+    "arrow": _draw_arrow,
+    "cloud": _draw_cloud,
+    "callout": _draw_callout,
+    "stamp": _draw_stamp,
+    "measure_area": _draw_measure_area,
+    "scale": _draw_scale,
+    "export": _draw_export,
+    "compare": _draw_compare,
+    "grid": _draw_grid,
+    "snap": _draw_snap,
+    "loupe": _draw_loupe,
+    "invert": _draw_invert,
+    "splitview": _draw_splitview,
+    "capture": _draw_capture,
+})
+
+
 def make_icon(kind: str, color: QColor, accent: QColor | None = None) -> QIcon:
     pix = _pixmap()
     r = QRectF(0, 0, SIZE, SIZE)

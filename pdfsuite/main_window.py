@@ -2,23 +2,26 @@ from __future__ import annotations
 
 import os
 
-from PySide6.QtCore import Qt, QSettings, QSize
+from PySide6.QtCore import Qt, QSettings
 from PySide6.QtGui import QAction, QActionGroup, QColor, QKeySequence
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QTabWidget, QWidget, QHBoxLayout, QSplitter,
-    QToolBar, QFileDialog, QMessageBox, QInputDialog, QLabel, QSpinBox, QDialog,
-    QColorDialog, QLineEdit, QToolButton, QStyle,
+    QToolBar, QFileDialog, QMessageBox, QInputDialog, QLabel, QDialog,
+    QColorDialog, QLineEdit, QComboBox, QProgressDialog,
 )
 
-from .pdf_document import PdfDocument
+from .pdf_document import PdfDocument, STAMP_COLORS
 from .page_view import PdfGraphicsView
 from .thumbnail_panel import ThumbnailPanel
 from .tools import Tool
 from .dialogs import (
-    ask_password, ask_page_ranges, TextEditDialog, SignatureDialog,
+    ask_password, ask_page_ranges, TextEditDialog, SignatureDialog, ScaleDialog,
 )
+from .ribbon import Ribbon
 from . import theme as theme_mod
 from .icons import make_icon
+
+CUSTOM_STAMP = "Personnalisé…"
 
 
 class DocumentTab(QWidget):
@@ -27,12 +30,16 @@ class DocumentTab(QWidget):
         self.pdf_document = pdf_document
 
         self.view = PdfGraphicsView(pdf_document)
+        self.view2: PdfGraphicsView | None = None   # split view (idea 25)
         self.thumbnails = ThumbnailPanel()
         self.thumbnails.rebuild(pdf_document)
 
+        self.view_splitter = QSplitter(Qt.Horizontal)
+        self.view_splitter.addWidget(self.view)
+
         splitter = QSplitter(Qt.Horizontal)
         splitter.addWidget(self.thumbnails)
-        splitter.addWidget(self.view)
+        splitter.addWidget(self.view_splitter)
         splitter.setStretchFactor(0, 0)
         splitter.setStretchFactor(1, 1)
         splitter.setSizes([160, 800])
@@ -42,6 +49,9 @@ class DocumentTab(QWidget):
         layout.addWidget(splitter)
 
         self.thumbnails.pageActivated.connect(self.view.goto_page)
+
+    def views(self) -> list[PdfGraphicsView]:
+        return [v for v in (self.view, self.view2) if v is not None]
 
     @property
     def file_path(self) -> str | None:
@@ -68,13 +78,13 @@ class MainWindow(QMainWindow):
         self._current_tool = Tool.SELECT
         self._current_color = (0.9, 0.1, 0.1)
         self._signature_png: bytes | None = None
-        self._tab_views: list[PdfGraphicsView] = []
 
         self.settings = QSettings("PDFSuite", "PDFSuite")
         self._dark = bool(self.settings.value("dark_theme", False, type=bool))
 
+        self._build_actions()
         self._build_menu()
-        self._build_toolbar()
+        self._build_ribbon()
         self._build_statusbar()
         self._update_actions_enabled()
         self._apply_theme()
@@ -95,213 +105,237 @@ class MainWindow(QMainWindow):
             action.setIcon(self._icon(kind, accent))
         self._update_theme_action()
 
-    # -- ui construction -------------------------------------------------
-    def _build_menu(self):
-        self._action_icons: dict[QAction, tuple[str, bool]] = {}
-        m = self.menuBar()
+    def _act(self, text, slot=None, icon=None, accent=False, shortcut=None,
+             checkable=False, tip=None, needs_doc=True) -> QAction:
+        a = QAction(text, self, checkable=checkable)
+        if slot is not None:
+            a.triggered.connect(slot)
+        if icon:
+            self._set_icon(a, icon, accent)
+        if shortcut is not None:
+            a.setShortcut(shortcut)
+        if tip:
+            a.setToolTip(tip)
+            a.setStatusTip(tip)
+        # added to the window too, so shortcuts work whatever ribbon tab is shown
+        self.addAction(a)
+        if needs_doc:
+            self._doc_actions.append(a)
+        return a
 
+    # -- actions --------------------------------------------------------
+    TOOL_DEFS = {
+        # tool: (label, icon, accent, tip)
+        Tool.SELECT: ("Sélectionner", "select", False, "Sélectionner / déplacer les objets (Échap)"),
+        Tool.PAN: ("Main", "pan", False, "Faire défiler la page à la souris"),
+        Tool.HIGHLIGHT: ("Surligner", "highlight", True, None),
+        Tool.UNDERLINE: ("Souligner", "underline", True, None),
+        Tool.STRIKEOUT: ("Barrer", "strikeout", True, None),
+        Tool.FREETEXT: ("Texte libre", "freetext", True, None),
+        Tool.NOTE: ("Note", "note", False, None),
+        Tool.INK: ("Dessin", "ink", True, None),
+        Tool.RECT: ("Rectangle", "rect", True, None),
+        Tool.ELLIPSE: ("Ellipse", "ellipse", True, None),
+        Tool.LINE: ("Ligne", "line", True, None),
+        Tool.ARROW: ("Flèche", "arrow", True, "Glisser du départ vers la pointe"),
+        Tool.CLOUD: ("Nuage", "cloud", True, "Nuage de révision : glisser pour entourer la zone"),
+        Tool.CALLOUT: ("Légende", "callout", True,
+                       "Glisser du point visé vers l'endroit du texte"),
+        Tool.STAMP: ("Tampon", "stamp", False, "Cliquer pour poser le tampon choisi (date + nom)"),
+        Tool.ERASER: ("Gomme", "eraser", False, None),
+        Tool.TEXTEDIT: ("Modifier texte", "textedit", False, None),
+        Tool.SIGNATURE: ("Signature", "signature", False, None),
+        Tool.MEASURE_LINE: ("Longueur", "measure_line", False, "Mesurer une ligne"),
+        Tool.MEASURE_PERIMETER: ("Périmètre", "measure_perimeter", False,
+                                 "Clic à chaque coin, clic droit ou Entrée pour terminer"),
+        Tool.MEASURE_AREA: ("Surface", "measure_area", False,
+                            "Surface en m² : clic à chaque coin, clic droit ou Entrée pour terminer"),
+        Tool.CAPTURE: ("Capture", "capture", False,
+                       "Copier une zone (avec les cotes) dans le presse-papiers"),
+    }
+
+    def _build_actions(self):
+        self._action_icons: dict[QAction, tuple[str, bool]] = {}
+        self._doc_actions: list[QAction] = []
+
+        # file
+        self.act_open = self._act("Ouvrir", self.open_file, "open", shortcut=QKeySequence.Open,
+                                  needs_doc=False)
+        self.act_save = self._act("Enregistrer sous", self.save_current, "save",
+                                  shortcut=QKeySequence.Save,
+                                  tip="Enregistre une copie : le fichier d'origine n'est jamais modifié")
+        self.act_close_tab = self._act("Fermer l'onglet",
+                                       lambda: self.close_tab(self.tabs.currentIndex()),
+                                       shortcut=QKeySequence.Close)
+
+        # tools (exclusive)
+        group = QActionGroup(self)
+        group.setExclusive(True)
+        self._tool_actions: dict[Tool, QAction] = {}
+        for tool, (label, icon, accent, tip) in self.TOOL_DEFS.items():
+            a = self._act(label, None, icon, accent, checkable=True, tip=tip)
+            a.triggered.connect(lambda checked, t=tool: self._select_tool(t))
+            group.addAction(a)
+            self._tool_actions[tool] = a
+        self._tool_actions[Tool.SELECT].setChecked(True)
+
+        self.act_color = self._act("Couleur", self.pick_color, "color", accent=True)
+        self.act_new_signature = self._act("Nouvelle signature", self.new_signature, "signature")
+        self.act_form_mode = self._act("Formulaire", self.toggle_form_mode, "form", checkable=True)
+
+        # measures / plans
+        self.act_scale = self._act("Échelle", self.choose_scale, "scale",
+                                   tip="Choisir l'échelle du plan (1:50, 1:100…) ou la calibrer")
+        self.act_export_measures = self._act("Exporter mesures", self.export_measures, "export",
+                                             tip="Toutes les mesures du document vers Excel (CSV)")
+        self.act_compare = self._act("Comparer", self.compare_plans, "compare",
+                                     tip="Comparer ce plan avec une autre version (ajouts / suppressions)")
+        self.act_grid = self._act("Grille", self.toggle_grid, "grid", checkable=True,
+                                  tip="Afficher une grille (pas en mètres si l'échelle est connue)")
+        self.act_snap = self._act("Aimanter", self.toggle_snap, "snap", checkable=True,
+                                  tip="Accrocher les tracés aux points de la grille")
+
+        # pages
+        self.act_insert_blank = self._act("Page vierge", self.insert_blank_page, "insertblank")
+        self.act_delete_pages = self._act("Supprimer", self.delete_selected_pages, "deletepages")
+        self.act_rotate_left = self._act("Rotation -90°", lambda: self.rotate_selected(-90), "rotateleft")
+        self.act_rotate_right = self._act("Rotation +90°", lambda: self.rotate_selected(90), "rotateright")
+        self.act_insert_pdf = self._act("Insérer un PDF", self.insert_pdf, "insertpdf")
+        self.act_extract = self._act("Extraire", self.extract_pages, "extract")
+        self.act_split = self._act("Diviser", self.split_document, "split")
+
+        # protect
+        self.act_set_password = self._act("Mot de passe", self.set_password, "password")
+
+        # view
+        self.act_zoom_in = self._act("Zoom +", lambda: self.zoom_by(1.15), "zoomin",
+                                     shortcut=QKeySequence.ZoomIn)
+        self.act_zoom_out = self._act("Zoom -", lambda: self.zoom_by(1 / 1.15), "zoomout",
+                                      shortcut=QKeySequence.ZoomOut)
+        self.act_zoom_100 = self._act("Zoom 100%", lambda: self.zoom_to(1.33))
+        self.act_loupe = self._act("Loupe", self.toggle_loupe, "loupe", checkable=True,
+                                   tip="Loupe qui suit la souris")
+        self.act_invert = self._act("Inverser couleurs", self.toggle_invert, "invert",
+                                    checkable=True, tip="Page sombre, traits clairs")
+        self.act_split_view = self._act("Vue fractionnée", self.toggle_split_view, "splitview",
+                                        checkable=True, tip="Deux vues côte à côte du même document")
+        self.act_toggle_theme = self._act("Thème sombre", self.toggle_theme, needs_doc=False)
+
+    def _build_menu(self):
+        m = self.menuBar()
         file_menu = m.addMenu("&Fichier")
-        self.act_open = QAction("Ouvrir...", self, shortcut=QKeySequence.Open,
-                                 triggered=self.open_file)
-        self.act_save = QAction("Enregistrer", self, shortcut=QKeySequence.Save,
-                                 triggered=lambda: self.save_current(False))
-        self.act_save_as = QAction("Enregistrer sous...", self,
-                                    shortcut=QKeySequence.SaveAs,
-                                    triggered=lambda: self.save_current(True))
-        self.act_close_tab = QAction("Fermer l'onglet", self, shortcut=QKeySequence.Close,
-                                      triggered=lambda: self.close_tab(self.tabs.currentIndex()))
-        self._set_icon(self.act_open, "open")
-        self._set_icon(self.act_save, "save")
-        self._set_icon(self.act_save_as, "save")
-        for a in (self.act_open, self.act_save, self.act_save_as, self.act_close_tab):
+        for a in (self.act_open, self.act_save, self.act_close_tab):
             file_menu.addAction(a)
         file_menu.addSeparator()
         file_menu.addAction(QAction("Quitter", self, triggered=self.close))
 
-        page_menu = m.addMenu("&Pages")
-        self.act_insert_blank = QAction("Insérer une page vierge", self,
-                                         triggered=self.insert_blank_page)
-        self.act_delete_pages = QAction("Supprimer la sélection", self,
-                                         triggered=self.delete_selected_pages)
-        self.act_rotate_left = QAction("Rotation -90°", self,
-                                        triggered=lambda: self.rotate_selected(-90))
-        self.act_rotate_right = QAction("Rotation +90°", self,
-                                         triggered=lambda: self.rotate_selected(90))
-        self.act_insert_pdf = QAction("Insérer un PDF...", self,
-                                       triggered=self.insert_pdf)
-        self.act_extract = QAction("Extraire des pages...", self,
-                                    triggered=self.extract_pages)
-        self.act_split = QAction("Diviser le document...", self,
-                                  triggered=self.split_document)
-        self._set_icon(self.act_insert_blank, "insertblank")
-        self._set_icon(self.act_delete_pages, "deletepages")
-        self._set_icon(self.act_rotate_left, "rotateleft")
-        self._set_icon(self.act_rotate_right, "rotateright")
-        self._set_icon(self.act_insert_pdf, "insertpdf")
-        self._set_icon(self.act_extract, "extract")
-        self._set_icon(self.act_split, "split")
+    def _build_ribbon(self):
+        self.ribbon = Ribbon()
+        holder = QToolBar("Ruban")
+        holder.setMovable(False)
+        holder.setFloatable(False)
+        holder.addWidget(self.ribbon)
+        self.addToolBar(holder)
+        t = self._tool_actions
+
+        home = self.ribbon.add_page("Accueil")
+        for a in (self.act_open, self.act_save):
+            home.addAction(a)
+        home.addSeparator()
+        home.addAction(t[Tool.SELECT])
+        home.addAction(t[Tool.PAN])
+        home.addSeparator()
+        home.addAction(self.act_zoom_out)
+        home.addAction(self.act_zoom_in)
+        home.addSeparator()
+        home.addAction(t[Tool.TEXTEDIT])
+        home.addAction(self.act_form_mode)
+        home.addAction(t[Tool.SIGNATURE])
+        home.addAction(self.act_new_signature)
+        home.addSeparator()
+        home.addAction(t[Tool.MEASURE_LINE])
+        home.addAction(t[Tool.CAPTURE])
+        home.addSeparator()
+        home.addAction(self.act_toggle_theme)
+
+        comments = self.ribbon.add_page("Commentaires")
+        comments.addAction(t[Tool.SELECT])
+        comments.addSeparator()
+        for tool in (Tool.HIGHLIGHT, Tool.UNDERLINE, Tool.STRIKEOUT, Tool.FREETEXT, Tool.NOTE):
+            comments.addAction(t[tool])
+        comments.addSeparator()
+        for tool in (Tool.INK, Tool.RECT, Tool.ELLIPSE, Tool.LINE, Tool.ARROW, Tool.CLOUD,
+                     Tool.CALLOUT):
+            comments.addAction(t[tool])
+        comments.addSeparator()
+        comments.addAction(t[Tool.STAMP])
+        self.stamp_combo = QComboBox()
+        self.stamp_combo.addItems(list(STAMP_COLORS.keys()) + [CUSTOM_STAMP])
+        self.stamp_combo.setToolTip("Texte du tampon (la date et votre nom sont ajoutés)")
+        self.stamp_combo.activated.connect(self._on_stamp_chosen)
+        comments.addWidget(self.stamp_combo)
+        comments.addSeparator()
+        comments.addAction(self.act_color)
+        comments.addAction(t[Tool.ERASER])
+
+        measures = self.ribbon.add_page("Mesures")
+        measures.addAction(t[Tool.SELECT])
+        measures.addSeparator()
+        for tool in (Tool.MEASURE_LINE, Tool.MEASURE_PERIMETER, Tool.MEASURE_AREA):
+            measures.addAction(t[tool])
+        measures.addAction(self.act_scale)
+        measures.addSeparator()
+        measures.addAction(self.act_grid)
+        measures.addAction(self.act_snap)
+        measures.addSeparator()
+        measures.addAction(self.act_export_measures)
+        measures.addAction(self.act_compare)
+        measures.addAction(t[Tool.CAPTURE])
+
+        pages = self.ribbon.add_page("Pages")
         for a in (self.act_insert_blank, self.act_delete_pages, self.act_rotate_left,
-                  self.act_rotate_right, self.act_insert_pdf, self.act_extract, self.act_split):
-            page_menu.addAction(a)
+                  self.act_rotate_right):
+            pages.addAction(a)
+        pages.addSeparator()
+        for a in (self.act_insert_pdf, self.act_extract, self.act_split):
+            pages.addAction(a)
 
-        security_menu = m.addMenu("&Sécurité")
-        self.act_set_password = QAction("Ajouter un mot de passe...", self,
-                                         triggered=self.set_password)
-        self._set_icon(self.act_set_password, "password")
-        security_menu.addAction(self.act_set_password)
+        protect = self.ribbon.add_page("Protéger")
+        protect.addAction(self.act_set_password)
 
-        view_menu = m.addMenu("&Affichage")
-        self.act_zoom_in = QAction("Zoom avant", self, shortcut=QKeySequence.ZoomIn,
-                                    triggered=lambda: self.zoom_by(1.15))
-        self.act_zoom_out = QAction("Zoom arrière", self, shortcut=QKeySequence.ZoomOut,
-                                     triggered=lambda: self.zoom_by(1 / 1.15))
-        self.act_zoom_100 = QAction("Zoom 100%", self, triggered=lambda: self.zoom_to(1.33))
-        self._set_icon(self.act_zoom_in, "zoomin")
-        self._set_icon(self.act_zoom_out, "zoomout")
-        for a in (self.act_zoom_in, self.act_zoom_out, self.act_zoom_100):
-            view_menu.addAction(a)
-        view_menu.addSeparator()
-        self.act_toggle_theme = QAction("Thème sombre", self, checkable=True,
-                                         checked=self._dark, triggered=self.toggle_theme)
-        view_menu.addAction(self.act_toggle_theme)
+        view = self.ribbon.add_page("Affichage")
+        for a in (self.act_zoom_out, self.act_zoom_in, self.act_zoom_100):
+            view.addAction(a)
+        view.addSeparator()
+        for a in (self.act_loupe, self.act_invert, self.act_split_view, self.act_grid):
+            view.addAction(a)
+        view.addSeparator()
+        view.addAction(self.act_toggle_theme)
 
-    def _tool_action(self, text: str, tool: Tool, group: QActionGroup) -> QAction:
-        act = QAction(text, self, checkable=True)
-        act.triggered.connect(lambda checked, t=tool: self._select_tool(t))
-        group.addAction(act)
-        return act
-
-    TOOL_ICONS = {
-        Tool.PAN: ("pan", False),
-        Tool.SELECT: ("select", False),
-        Tool.HIGHLIGHT: ("highlight", True),
-        Tool.UNDERLINE: ("underline", True),
-        Tool.STRIKEOUT: ("strikeout", True),
-        Tool.FREETEXT: ("freetext", True),
-        Tool.NOTE: ("note", False),
-        Tool.INK: ("ink", True),
-        Tool.RECT: ("rect", True),
-        Tool.ELLIPSE: ("ellipse", True),
-        Tool.LINE: ("line", True),
-        Tool.ERASER: ("eraser", False),
-        Tool.TEXTEDIT: ("textedit", False),
-        Tool.SIGNATURE: ("signature", False),
-        Tool.MEASURE_LINE: ("measure_line", False),
-        Tool.MEASURE_PERIMETER: ("measure_perimeter", False),
-    }
-
-    def _build_toolbar(self):
-        tb = QToolBar("Principal")
-        tb.setToolButtonStyle(Qt.ToolButtonTextUnderIcon)
-        tb.setIconSize(QSize(22, 22))
-        tb.setMovable(False)
-        self.addToolBar(tb)
-
-        tb.addAction(self.act_open)
-        tb.addAction(self.act_save)
-        tb.addSeparator()
-
-        group = QActionGroup(self)
-        group.setExclusive(True)
-        tool_defs = [
-            ("Sélectionner", Tool.SELECT),
-            ("Main", Tool.PAN),
-            ("Surligner", Tool.HIGHLIGHT),
-            ("Souligner", Tool.UNDERLINE),
-            ("Barrer", Tool.STRIKEOUT),
-            ("Texte libre", Tool.FREETEXT),
-            ("Note", Tool.NOTE),
-            ("Dessin", Tool.INK),
-            ("Rectangle", Tool.RECT),
-            ("Ellipse", Tool.ELLIPSE),
-            ("Ligne", Tool.LINE),
-            ("Gomme", Tool.ERASER),
-            ("Modifier texte", Tool.TEXTEDIT),
-            ("Signature", Tool.SIGNATURE),
-        ]
-        self._tool_actions = {}
-        for text, tool in tool_defs:
-            act = self._tool_action(text, tool, group)
-            kind, accent = self.TOOL_ICONS[tool]
-            self._set_icon(act, kind, accent)
-            if tool == Tool.SELECT:
-                act.setChecked(True)
-            self._tool_actions[tool] = act
-            tb.addAction(act)
-
-        tb.addSeparator()
-        measure_defs = [
-            ("Mesurer une ligne", Tool.MEASURE_LINE),
-            ("Périmètre", Tool.MEASURE_PERIMETER),
-        ]
-        for text, tool in measure_defs:
-            act = self._tool_action(text, tool, group)
-            kind, accent = self.TOOL_ICONS[tool]
-            self._set_icon(act, kind, accent)
-            self._tool_actions[tool] = act
-            tb.addAction(act)
-        self.act_reset_scale = QAction("Réinitialiser l'échelle", self,
-                                        triggered=self.reset_scale)
-        tb.addAction(self.act_reset_scale)
-
-        tb.addSeparator()
-        self.act_color = QAction("Couleur", self, triggered=self.pick_color)
-        self._set_icon(self.act_color, "color", accent=True)
-        tb.addAction(self.act_color)
-
-        self.act_new_signature = QAction("Nouvelle signature", self, triggered=self.new_signature)
-        self._set_icon(self.act_new_signature, "signature")
-        tb.addAction(self.act_new_signature)
-
-        tb.addSeparator()
-        self.act_form_mode = QAction("Formulaire", self, checkable=True,
-                                      triggered=self.toggle_form_mode)
-        self._set_icon(self.act_form_mode, "form")
-        tb.addAction(self.act_form_mode)
-
-        tb.addSeparator()
-        tb.addAction(self.act_insert_blank)
-        tb.addAction(self.act_delete_pages)
-        tb.addAction(self.act_rotate_left)
-        tb.addAction(self.act_rotate_right)
-
-        tb.addSeparator()
-        tb.addAction(self.act_zoom_out)
-        tb.addAction(self.act_zoom_in)
-
-        tb.addSeparator()
-        self.act_toggle_theme_tb = QAction("Thème", self, triggered=self.toggle_theme)
-        tb.addAction(self.act_toggle_theme_tb)
+        self.ribbon.set_current(int(self.settings.value("ribbon_tab", 0, type=int)))
+        self.ribbon.currentChanged.connect(lambda i: self.settings.setValue("ribbon_tab", i))
         self._update_theme_action()
 
     def _build_statusbar(self):
         sb = self.statusBar()
+        self.cursor_label = QLabel("")
+        self.scale_label = QLabel("")
         self.page_label = QLabel("Page — / —")
         self.zoom_label = QLabel("100%")
-        sb.addPermanentWidget(self.page_label)
-        sb.addPermanentWidget(self.zoom_label)
+        for w in (self.cursor_label, self.scale_label, self.page_label, self.zoom_label):
+            sb.addPermanentWidget(w)
 
     def _update_actions_enabled(self):
         has_doc = self.current_tab() is not None
-        for a in (self.act_save, self.act_save_as, self.act_close_tab,
-                  self.act_insert_blank, self.act_delete_pages, self.act_rotate_left,
-                  self.act_rotate_right, self.act_insert_pdf, self.act_extract,
-                  self.act_split, self.act_set_password, self.act_zoom_in,
-                  self.act_zoom_out, self.act_zoom_100, self.act_form_mode,
-                  self.act_color, self.act_new_signature, self.act_reset_scale):
+        for a in self._doc_actions:
             a.setEnabled(has_doc)
-        for act in self._tool_actions.values():
-            act.setEnabled(has_doc)
+        self.stamp_combo.setEnabled(has_doc)
 
     # -- theme ----------------------------------------------------------
     def _update_theme_action(self):
         kind = "theme_light" if self._dark else "theme_dark"
-        label = "Thème clair" if self._dark else "Thème sombre"
-        self.act_toggle_theme_tb.setIcon(self._icon(kind))
-        self.act_toggle_theme_tb.setText(label)
-        self.act_toggle_theme.blockSignals(True)
-        self.act_toggle_theme.setChecked(self._dark)
-        self.act_toggle_theme.blockSignals(False)
+        self.act_toggle_theme.setIcon(self._icon(kind))
+        self.act_toggle_theme.setText("Thème clair" if self._dark else "Thème sombre")
 
     def toggle_theme(self):
         self.set_theme(not self._dark)
@@ -316,8 +350,8 @@ class MainWindow(QMainWindow):
         theme_mod.apply_theme(app, self._dark)
         surround = theme_mod.surround_color(self._dark)
         for i in range(self.tabs.count()):
-            tab = self.tabs.widget(i)
-            tab.view.apply_theme(surround)
+            for v in self.tabs.widget(i).views():
+                v.apply_theme(surround)
         self._apply_icons()
 
     # -- tab helpers ------------------------------------------------------
@@ -327,11 +361,17 @@ class MainWindow(QMainWindow):
     def _on_tab_changed(self, _index):
         tab = self.current_tab()
         if tab is not None:
-            tab.view.set_tool(self._current_tool)
-            tab.view.set_color(self._current_color)
-            tab.view.pageChanged.connect(self._update_page_label, Qt.UniqueConnection)
+            for v in tab.views():
+                v.set_tool(self._current_tool)
+                v.set_color(self._current_color)
             self._update_page_label(tab.view.current_page())
             self.zoom_label.setText(f"{int(tab.view.zoom / 1.33 * 100)}%")
+            self.act_grid.setChecked(tab.view.show_grid)
+            self.act_snap.setChecked(tab.view.snap_to_grid)
+            self.act_invert.setChecked(tab.view.invert_colors)
+            self.act_split_view.setChecked(tab.view2 is not None)
+            self.act_form_mode.setChecked(tab.view.form_mode)
+        self._update_scale_label()
         self._update_actions_enabled()
 
     def _update_page_label(self, page_no: int):
@@ -339,6 +379,16 @@ class MainWindow(QMainWindow):
         if tab is None:
             return
         self.page_label.setText(f"Page {page_no + 1} / {tab.pdf_document.page_count}")
+
+    def _update_scale_label(self):
+        tab = self.current_tab()
+        if tab is None:
+            self.scale_label.setText("")
+            return
+        text = tab.pdf_document.scale_description()
+        if tab.view.show_grid:
+            text += " · " + tab.view.grid_description()
+        self.scale_label.setText(text)
 
     # -- file operations ----------------------------------------------
     def open_file(self, path: str | None = None):
@@ -358,48 +408,82 @@ class MainWindow(QMainWindow):
             except Exception as exc:
                 QMessageBox.critical(self, "Erreur", f"Impossible d'ouvrir le fichier :\n{exc}")
                 return
+        self._add_document_tab(doc, os.path.basename(path))
 
+    def _add_document_tab(self, doc: PdfDocument, title: str) -> DocumentTab:
         tab = DocumentTab(doc)
-        tab.view.apply_theme(theme_mod.surround_color(self._dark))
-        tab.view.set_color(self._current_color)
-        tab.view.documentModified.connect(lambda: self._on_doc_modified(tab))
-        tab.view.requestTextEdit.connect(
-            lambda pno, bbox, text, size: self._on_text_edit_requested(tab, pno, bbox, text, size)
-        )
-        tab.view.requestSignaturePlacement.connect(
-            lambda pno, pt: self._on_signature_requested(tab, pno, pt)
-        )
-        tab.view.zoomChanged.connect(lambda z, t=tab: self._on_zoom_changed(t, z))
+        self._wire_view(tab, tab.view)
         tab.thumbnails.deletePagesRequested.connect(
             lambda pages: self._delete_pages(tab, pages)
         )
         tab.thumbnails.pagesReordered.connect(
             lambda order: self._reorder_pages(tab, order)
         )
-        index = self.tabs.addTab(tab, os.path.basename(path))
+        index = self.tabs.addTab(tab, title + (" *" if doc.dirty else ""))
         self.tabs.setCurrentIndex(index)
+        return tab
+
+    def _wire_view(self, tab: DocumentTab, view: PdfGraphicsView):
+        view.apply_theme(theme_mod.surround_color(self._dark))
+        view.set_color(self._current_color)
+        view.set_tool(self._current_tool)
+        view.stamp_label = self._stamp_label()
+        view.documentModified.connect(lambda v=view: self._on_doc_modified(tab, v))
+        view.requestTextEdit.connect(
+            lambda pno, bbox, text, size, v=view: self._on_text_edit_requested(tab, v, pno, bbox, text, size)
+        )
+        view.requestSignaturePlacement.connect(
+            lambda pno, pt, v=view: self._on_signature_requested(tab, v, pno, pt)
+        )
+        view.zoomChanged.connect(lambda z, t=tab: self._on_zoom_changed(t, z))
+        view.pageChanged.connect(lambda n, t=tab: self.current_tab() is t and self._update_page_label(n))
+        view.statusMessage.connect(lambda msg: self.statusBar().showMessage(msg, 5000))
+        view.cursorInfo.connect(self.cursor_label.setText)
+        view.requestSelectTool.connect(lambda: self._activate_tool(Tool.SELECT))
 
     def _on_zoom_changed(self, tab: DocumentTab, zoom: float):
         if self.current_tab() is tab:
             self.zoom_label.setText(f"{int(zoom / 1.33 * 100)}%")
+            self._update_scale_label()
 
-    def _on_doc_modified(self, tab: DocumentTab):
+    def _on_doc_modified(self, tab: DocumentTab, source_view: PdfGraphicsView | None = None):
         idx = self.tabs.indexOf(tab)
-        title = os.path.basename(tab.file_path or "Sans titre")
+        title = self.tabs.tabText(idx)
         if not title.endswith("*"):
             self.tabs.setTabText(idx, title + " *")
+        # keep the other half of a split view in sync
+        for v in tab.views():
+            if v is not source_view and source_view is not None:
+                v.refresh_all()
+        self._update_scale_label()
 
-    def save_current(self, save_as: bool):
+    def _suggest_save_path(self, tab: DocumentTab) -> str:
+        doc = tab.pdf_document
+        if doc.path and not doc.is_original(doc.path):
+            return doc.path
+        src = doc.original_path or os.path.join(os.path.expanduser("~"), "Documents",
+                                                (doc.title or "document") + ".pdf")
+        base, _ext = os.path.splitext(src)
+        return base + "_modifié.pdf"
+
+    def save_current(self, *_args):
+        """Always "Enregistrer sous": the opened file is never overwritten."""
         tab = self.current_tab()
         if tab is None:
-            return
-        path = tab.file_path
-        if save_as or not path:
-            path, _ = QFileDialog.getSaveFileName(
-                self, "Enregistrer sous", path or "document.pdf", "PDF (*.pdf)"
+            return False
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Enregistrer sous (le fichier d'origine reste intact)",
+            self._suggest_save_path(tab), "PDF (*.pdf)"
+        )
+        if not path:
+            return False
+        if tab.pdf_document.is_original(path):
+            QMessageBox.warning(
+                self, "Fichier d'origine",
+                "C'est le fichier d'origine : il n'est jamais écrasé.\n"
+                "Choisissez un autre nom."
             )
-            if not path:
-                return
+            return self.save_current()
         try:
             if getattr(tab.pdf_document, "_pending_encrypt", None):
                 tab.pdf_document.save_with_pending_encryption(path)
@@ -407,9 +491,11 @@ class MainWindow(QMainWindow):
                 tab.pdf_document.save(path)
         except Exception as exc:
             QMessageBox.critical(self, "Erreur", f"Échec de l'enregistrement :\n{exc}")
-            return
+            return False
         idx = self.tabs.indexOf(tab)
         self.tabs.setTabText(idx, os.path.basename(path))
+        self.statusBar().showMessage(f"Enregistré : {path}", 6000)
+        return True
 
     def close_tab(self, index: int):
         tab = self.tabs.widget(index)
@@ -425,9 +511,10 @@ class MainWindow(QMainWindow):
                 return
             if resp == QMessageBox.Save:
                 self.tabs.setCurrentIndex(index)
-                self.save_current(False)
-                if tab.dirty:
+                if not self.save_current():
                     return
+        for v in tab.views():
+            v.set_loupe(False)
         tab.pdf_document.close()
         self.tabs.removeTab(index)
 
@@ -436,7 +523,12 @@ class MainWindow(QMainWindow):
         self._current_tool = tool
         tab = self.current_tab()
         if tab is not None:
-            tab.view.set_tool(tool)
+            for v in tab.views():
+                v.set_tool(tool)
+
+    def _activate_tool(self, tool: Tool):
+        self._tool_actions[tool].setChecked(True)
+        self._select_tool(tool)
 
     def pick_color(self):
         c = QColorDialog.getColor(QColor.fromRgbF(*self._current_color), self, "Couleur")
@@ -444,31 +536,195 @@ class MainWindow(QMainWindow):
             self._current_color = (c.redF(), c.greenF(), c.blueF())
             tab = self.current_tab()
             if tab is not None:
-                tab.view.set_color(self._current_color)
+                for v in tab.views():
+                    v.set_color(self._current_color)
             self._apply_icons()
 
-    def reset_scale(self):
-        tab = self.current_tab()
-        if tab is None:
-            return
-        tab.pdf_document.scale_points_per_meter = None
-        QMessageBox.information(
-            self, "Échelle réinitialisée",
-            "La prochaine mesure (ligne ou périmètre) vous demandera à\n"
-            "nouveau l'échelle réelle du plan."
-        )
+    def _stamp_label(self) -> str:
+        if not hasattr(self, "_custom_stamp"):
+            self._custom_stamp = ""
+        text = self.stamp_combo.currentText() if hasattr(self, "stamp_combo") else "APPROUVÉ"
+        if text == CUSTOM_STAMP:
+            return self._custom_stamp or "VU"
+        return text
+
+    def _on_stamp_chosen(self, _index):
+        if self.stamp_combo.currentText() == CUSTOM_STAMP:
+            text, ok = QInputDialog.getText(self, "Tampon personnalisé",
+                                            "Texte du tampon :", text=getattr(self, "_custom_stamp", ""))
+            if ok and text.strip():
+                self._custom_stamp = text.strip().upper()
+        label = self._stamp_label()
+        for i in range(self.tabs.count()):
+            for v in self.tabs.widget(i).views():
+                v.stamp_label = label
+        self._activate_tool(Tool.STAMP)
 
     def new_signature(self):
         dlg = SignatureDialog(self)
         if dlg.exec() == QDialog.Accepted and not dlg.canvas.is_empty():
             self._signature_png = dlg.png_bytes()
-            self._tool_actions[Tool.SIGNATURE].setChecked(True)
-            self._select_tool(Tool.SIGNATURE)
+            self._activate_tool(Tool.SIGNATURE)
 
     def toggle_form_mode(self, checked: bool):
         tab = self.current_tab()
         if tab is not None:
             tab.view.set_form_mode(checked)
+
+    # -- plans / measures ----------------------------------------------
+    def choose_scale(self):
+        tab = self.current_tab()
+        if tab is None:
+            return
+        doc = tab.pdf_document
+        dlg = ScaleDialog(self, doc.scale_description())
+        if dlg.exec() != QDialog.Accepted:
+            return
+        ratio = dlg.ratio()
+        if ratio is None:
+            doc.scale_points_per_meter = None
+            self._activate_tool(Tool.MEASURE_LINE)
+            self.statusBar().showMessage(
+                "Tracez une ligne de longueur connue : sa longueur réelle vous sera demandée.", 8000)
+        else:
+            doc.set_ratio_scale(ratio)
+        for v in tab.views():
+            v.rebuild_annotations()
+            v.viewport().update()
+        self._on_doc_modified(tab)
+
+    def reset_scale(self):
+        tab = self.current_tab()
+        if tab is not None:
+            tab.pdf_document.scale_points_per_meter = None
+            self._update_scale_label()
+
+    def export_measures(self):
+        tab = self.current_tab()
+        if tab is None:
+            return
+        doc = tab.pdf_document
+        if not doc.measurements():
+            QMessageBox.information(self, "Exporter les mesures",
+                                    "Ce document ne contient encore aucune mesure.")
+            return
+        base = os.path.splitext(doc.original_path or doc.path or "mesures")[0]
+        path, _ = QFileDialog.getSaveFileName(self, "Exporter les mesures (Excel)",
+                                              base + "_mesures.csv", "CSV pour Excel (*.csv)")
+        if not path:
+            return
+        try:
+            n = doc.export_measurements_csv(path)
+        except Exception as exc:
+            QMessageBox.critical(self, "Erreur", f"Export impossible :\n{exc}")
+            return
+        if QMessageBox.question(self, "Mesures exportées",
+                                f"{n} mesure(s) exportée(s).\nOuvrir le fichier dans Excel ?"
+                                ) == QMessageBox.Yes:
+            os.startfile(path)
+
+    def compare_plans(self):
+        tab = self.current_tab()
+        if tab is None:
+            return
+        import pymupdf
+        from .compare import build_comparison_pdf
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Nouvelle version du plan à comparer", "", "PDF (*.pdf)")
+        if not path:
+            return
+        try:
+            other = pymupdf.open(path)
+            if other.needs_pass:
+                pw = ask_password(self, os.path.basename(path))
+                if not pw or not other.authenticate(pw):
+                    return
+        except Exception as exc:
+            QMessageBox.critical(self, "Erreur", f"Impossible d'ouvrir :\n{exc}")
+            return
+        old_name = os.path.basename(tab.pdf_document.original_path or "ce document")
+        new_name = os.path.basename(path)
+        counts_differ = tab.pdf_document.page_count != other.page_count
+        n_total = min(tab.pdf_document.page_count, other.page_count)
+        progress = QProgressDialog("Comparaison en cours…", "Annuler", 0, n_total, self)
+        progress.setWindowModality(Qt.WindowModal)
+        progress.setMinimumDuration(300)
+
+        def step(i, n):
+            progress.setValue(i)
+            QApplication.processEvents()
+            return not progress.wasCanceled()
+
+        QApplication.setOverrideCursor(Qt.WaitCursor)
+        try:
+            data, n = build_comparison_pdf(tab.pdf_document, other, old_name, new_name,
+                                           progress=step)
+        except Exception as exc:
+            QMessageBox.critical(self, "Erreur", f"Comparaison impossible :\n{exc}")
+            return
+        finally:
+            QApplication.restoreOverrideCursor()
+            progress.close()
+            other.close()
+        if n == 0:
+            return
+        title = f"Comparaison {os.path.splitext(old_name)[0]}"
+        doc = PdfDocument(data=data, title=title)
+        self._add_document_tab(doc, title)
+        extra = " (nombre de pages différent : seules les premières sont comparées)" \
+            if counts_differ else ""
+        self.statusBar().showMessage(
+            f"{n} page(s) comparée(s) — rouge = supprimé, vert = ajouté.{extra}", 10000)
+
+    def toggle_grid(self, checked: bool):
+        tab = self.current_tab()
+        if tab is not None:
+            for v in tab.views():
+                v.set_grid(checked)
+        self._update_scale_label()
+
+    def toggle_snap(self, checked: bool):
+        tab = self.current_tab()
+        if tab is not None:
+            for v in tab.views():
+                v.snap_to_grid = checked
+            if checked and not self.act_grid.isChecked():
+                self.act_grid.setChecked(True)
+                self.toggle_grid(True)
+
+    def toggle_loupe(self, checked: bool):
+        for i in range(self.tabs.count()):
+            for v in self.tabs.widget(i).views():
+                v.set_loupe(checked)
+
+    def toggle_invert(self, checked: bool):
+        tab = self.current_tab()
+        if tab is not None:
+            for v in tab.views():
+                v.set_invert(checked)
+
+    def toggle_split_view(self, checked: bool):
+        tab = self.current_tab()
+        if tab is None:
+            return
+        if checked and tab.view2 is None:
+            v2 = PdfGraphicsView(tab.pdf_document)
+            v2.set_zoom(tab.view.zoom)
+            v2.set_grid(tab.view.show_grid)
+            v2.snap_to_grid = tab.view.snap_to_grid
+            v2.invert_colors = tab.view.invert_colors
+            v2.set_loupe(self.act_loupe.isChecked())
+            tab.view2 = v2
+            tab.view_splitter.addWidget(v2)
+            self._wire_view(tab, v2)
+            v2.refresh_all()
+            v2.goto_page(tab.view.current_page())
+        elif not checked and tab.view2 is not None:
+            v2 = tab.view2
+            tab.view2 = None
+            v2.set_loupe(False)
+            v2.setParent(None)
+            v2.deleteLater()
 
     # -- zoom / navigation --------------------------------------------
     def zoom_by(self, factor: float):
@@ -486,7 +742,8 @@ class MainWindow(QMainWindow):
     # -- page operations ----------------------------------------------
     def _refresh_thumbs(self, tab: DocumentTab):
         tab.thumbnails.rebuild(tab.pdf_document)
-        tab.view.refresh_all()
+        for v in tab.views():
+            v.refresh_all()
         self._on_doc_modified(tab)
 
     def insert_blank_page(self):
@@ -599,21 +856,19 @@ class MainWindow(QMainWindow):
         )
 
     # -- interactive edits from the view -------------------------------
-    def _on_text_edit_requested(self, tab: DocumentTab, page_no, bbox, text, fontsize):
+    def _on_text_edit_requested(self, tab: DocumentTab, view, page_no, bbox, text, fontsize):
         dlg = TextEditDialog(self, text, fontsize)
         if dlg.exec() == QDialog.Accepted:
             new_text, size = dlg.values()
-            tab.view.apply_text_edit(page_no, bbox, new_text, size)
-            self._on_doc_modified(tab)
+            view.apply_text_edit(page_no, bbox, new_text, size)
 
-    def _on_signature_requested(self, tab: DocumentTab, page_no, pt):
+    def _on_signature_requested(self, tab: DocumentTab, view, page_no, pt):
         if self._signature_png is None:
             dlg = SignatureDialog(self)
             if dlg.exec() != QDialog.Accepted or dlg.canvas.is_empty():
                 return
             self._signature_png = dlg.png_bytes()
-        tab.view.place_signature_image(page_no, pt, self._signature_png)
-        self._on_doc_modified(tab)
+        view.place_signature_image(page_no, pt, self._signature_png)
 
     # -- close handling -----------------------------------------------
     def closeEvent(self, event):
