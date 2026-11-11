@@ -942,6 +942,80 @@ def _area(pts):
                    for i in range(n))) / 2
 
 
+def _drawn(a, b, lines, tol):
+    """True when a line of the drawing runs along the edge a-b (a real wall
+    face, e.g. a cut corner), False for a pixel artefact."""
+    if not len(lines):
+        return False
+    L = math.dist(a, b)
+    if L < 1e-9:
+        return False
+    ux, uy = (b[0] - a[0]) / L, (b[1] - a[1]) / L
+    x0, y0, x1, y1 = lines.T
+    d0 = np.abs((x0 - a[0]) * uy - (y0 - a[1]) * ux)
+    d1 = np.abs((x1 - a[0]) * uy - (y1 - a[1]) * ux)
+    t0 = (x0 - a[0]) * ux + (y0 - a[1]) * uy
+    t1 = (x1 - a[0]) * ux + (y1 - a[1]) * uy
+    ov = np.minimum(np.maximum(t0, t1), L) - np.maximum(np.minimum(t0, t1), 0)
+    return bool(((d0 < tol) & (d1 < tol) & (ov > 0.7 * L)).any())
+
+
+def _regularize(poly, scale, lines=np.zeros((0, 4)), tol=1.0):
+    """Generic clean-up of the outline, whatever the plan:
+    - a short edge cutting a corner (chamfer) -> the real corner;
+    - a micro step (two parallel edges offset by a few cm) -> one straight
+      wall face, on the line of the longer edge."""
+    short, chamfer, micro, reach = 0.12 * scale, 0.3 * scale, 0.035 * scale, 0.3 * scale
+    pts = list(poly)
+    for _ in range(4 * len(pts) + 4):
+        n = len(pts)
+        if n < 4:
+            break
+        changed = False
+        for i in range(n):
+            p0, p1, p2, p3 = pts[i - 1], pts[i], pts[(i + 1) % n], pts[(i + 2) % n]
+            lc = math.dist(p1, p2)
+            if lc >= chamfer:
+                continue
+            prev, cur, nxt = (p0, p1), (p1, p2), (p2, p3)
+            if not _parallel(prev, nxt):
+                if _parallel(prev, cur) or _parallel(cur, nxt):
+                    continue
+                if lc >= short and _drawn(p1, p2, lines, tol):
+                    continue                 # a real cut corner of the wall
+                q = _intersect(prev, nxt)
+                if q is not None and math.dist(q, p1) <= reach and math.dist(q, p2) <= reach:
+                    j = (i + 1) % n
+                    pts[i] = q
+                    del pts[j]
+                    changed = True
+                    break
+            elif lc < short and _line_dist(p3, prev) <= micro:
+                # keep the line of the longer neighbour
+                if math.dist(p0, p1) >= math.dist(p2, p3):
+                    a, b = prev
+                    L = math.dist(a, b)
+                    ux, uy = (b[0] - a[0]) / L, (b[1] - a[1]) / L
+                    t = (p3[0] - a[0]) * ux + (p3[1] - a[1]) * uy
+                    new_p3 = (a[0] + ux * t, a[1] + uy * t)
+                    idx = sorted({i % n, (i + 1) % n}, reverse=True)
+                    pts[(i + 2) % n] = new_p3
+                else:
+                    a, b = nxt
+                    L = math.dist(a, b)
+                    ux, uy = (b[0] - a[0]) / L, (b[1] - a[1]) / L
+                    t = (p0[0] - a[0]) * ux + (p0[1] - a[1]) * uy
+                    pts[i - 1] = (a[0] + ux * t, a[1] + uy * t)
+                    idx = sorted({i % n, (i + 1) % n}, reverse=True)
+                for k in idx:
+                    del pts[k]
+                changed = True
+                break
+        if not changed:
+            break
+    return drop_collinear(pts, tol=0.05)
+
+
 def _remove_frames(poly, marks, scale):
     """Door frames / casings jut a few centimetres into the room next to
     the openings; plans measure the room without them. Steps and bumps of
@@ -1089,6 +1163,7 @@ def detect_room(doc, page_no: int, click_xy: tuple[float, float]):
     cx0, cx1, cy0, cy1 = min(xs) - 50, max(xs) + 50, min(ys) - 50, max(ys) + 50
     marks = [m for m in marks if cx0 < m[0] < cx1 and cy0 < m[1] < cy1]
     poly = _remove_frames(poly, marks, scale)
+    poly = _regularize(poly, scale, lines, tol)
     if len(poly) < 3:
         raise RoomError("Contour de pièce introuvable.")
     openings = _bridge_openings(prep, poly, scale)
