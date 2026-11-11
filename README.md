@@ -49,7 +49,7 @@ L'exe est aussi construit automatiquement par GitHub Actions à chaque push
   l'enregistrement ; ouverture de PDF déjà protégés par mot de passe.
 - **Interface** : thème clair / sombre (bouton dans la barre d'outils ou menu
   Affichage, préférence mémorisée entre les lancements), barre d'outils avec
-  icônes au-dessus du texte façon PDF-XChange, zoom Ctrl + molette centré
+  icônes au-dessus du texte, zoom Ctrl + molette centré
   sur le curseur.
 
 ## Limitations connues / à améliorer ensuite
