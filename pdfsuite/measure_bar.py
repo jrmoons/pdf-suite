@@ -85,7 +85,14 @@ class MeasureBar(QFrame):
         self.color_btn = QPushButton("Couleur")
         self.color_btn.setToolTip("Couleur des nouvelles mesures")
         lay.addWidget(self.color_btn)
-        from PySide6.QtWidgets import QCheckBox
+        from PySide6.QtWidgets import QCheckBox, QSpinBox
+        lay.addWidget(QLabel("Texte :"))
+        self.text_px = QSpinBox()
+        self.text_px.setRange(10, 60)
+        self.text_px.setSuffix(" px")
+        self.text_px.setToolTip("Taille du texte des cotes et mesures à l'écran")
+        self.text_px.setValue(int(self.settings.value("cote_text_px", 26)))
+        lay.addWidget(self.text_px)
         self.auto_cotes = QCheckBox("Cotes auto")
         self.auto_cotes.setToolTip("Pièce auto / Périmètre / Surface : poser aussi les cotes de "
                                    "chaque mur, avec les portes et fenêtres")

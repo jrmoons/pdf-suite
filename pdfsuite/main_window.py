@@ -358,6 +358,9 @@ class MainWindow(QMainWindow):
         self.measure_bar.applied.connect(self._on_measure_settings)
         self.measure_bar.colorChanged.connect(self._on_measure_color)
         self.measure_bar.auto_cotes.toggled.connect(self._on_auto_cotes)
+        self.measure_bar.text_px.valueChanged.connect(self._on_text_px)
+        from . import annotation_items as _ai
+        _ai.set_measure_text_px(self.measure_bar.text_px.value())
         self.measure_bar.calibrateRequested.connect(self.start_calibration)
 
         self.ribbon.set_current(int(self.settings.value("ribbon_tab", 0, type=int)))
@@ -658,6 +661,15 @@ class MainWindow(QMainWindow):
         for i in range(self.tabs.count()):
             for v in self.tabs.widget(i).views():
                 v.set_measure_color(rgb)
+
+    def _on_text_px(self, px: int):
+        from . import annotation_items as _ai
+        self.settings.setValue("cote_text_px", px)
+        _ai.set_measure_text_px(px)
+        for i in range(self.tabs.count()):
+            for v in self.tabs.widget(i).views():
+                v._refresh_labels()
+                v.rebuild_annotations()
 
     def _on_auto_cotes(self, checked: bool):
         self.settings.setValue("auto_cotes", checked)

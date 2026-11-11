@@ -513,7 +513,7 @@ class MeasureItemBase(QGraphicsObject):
     on-screen width) and the label keeps a constant on-screen size."""
 
     subject = "pdfsuite:measure_line"
-    LABEL_PX = 15          # label font size on screen, whatever the zoom
+    LABEL_PX = 20          # label font size on screen, whatever the zoom
 
     def __init__(self, view, page_no: int, annot, points: list[QPointF], color, label: str):
         super().__init__()
@@ -734,7 +734,7 @@ class DimensionItem(QGraphicsObject):
     offset); drag the A / B handles to move the measured points."""
 
     subject = "pdfsuite:measure_dimension"
-    LABEL_PX = 16
+    LABEL_PX = 26           # réglable : barre Mesure → « Texte »
     GAP_PX = 3          # gap between measured point and extension line
     OVER_PX = 6         # extension line overshoot past the dimension line
     TICK_PX = 6
@@ -1341,3 +1341,11 @@ def to_visual_rect(rect, page) -> QRectF:
     p1 = to_visual((rect.x0, rect.y0), page)
     p2 = to_visual((rect.x1, rect.y1), page)
     return QRectF(p1, p2).normalized()
+
+
+
+def set_measure_text_px(px: int):
+    """Size on screen of the cote / measure texts (pixels)."""
+    px = max(10, min(60, int(px)))
+    DimensionItem.LABEL_PX = px
+    MeasureItemBase.LABEL_PX = max(10, px - 2)
