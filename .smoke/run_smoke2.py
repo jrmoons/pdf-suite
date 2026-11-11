@@ -33,11 +33,9 @@ widgets = pdoc.widgets(0)
 print("widgets found:", [(w.field_name, w.field_type_string) for w in widgets])
 for w in widgets:
     if w.field_type_string == "Text":
-        w.field_value = "Jean Dupont"
-        w.update()
+        pdoc.set_widget_value(w, "Jean Dupont")
     elif w.field_type_string == "CheckBox":
-        w.field_value = True
-        w.update()
+        pdoc.set_widget_value(w, True)
 pdoc.save(os.path.abspath(".smoke/form_filled.pdf"))
 
 check = pymupdf.open(".smoke/form_filled.pdf")

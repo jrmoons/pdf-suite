@@ -483,7 +483,38 @@ def _draw_dimension(p: QPainter, r: QRectF, c: QColor):
     p.drawText(QRectF(r.left(), y + 2, r.width(), 10), Qt.AlignCenter, "3,25")
 
 
+def _draw_undo(p: QPainter, r: QRectF, c: QColor, mirror: bool = False):
+    path = QPainterPath()
+    if not mirror:
+        path.moveTo(r.left() + 7, r.top() + 11)
+        path.cubicTo(r.left() + 14, r.top() + 4, r.right() - 3, r.top() + 10, r.right() - 6, r.bottom() - 6)
+        p.drawPath(path)
+        p.drawLine(QPointF(r.left() + 7, r.top() + 11), QPointF(r.left() + 7, r.top() + 4))
+        p.drawLine(QPointF(r.left() + 7, r.top() + 11), QPointF(r.left() + 14, r.top() + 12))
+    else:
+        path.moveTo(r.right() - 7, r.top() + 11)
+        path.cubicTo(r.right() - 14, r.top() + 4, r.left() + 3, r.top() + 10, r.left() + 6, r.bottom() - 6)
+        p.drawPath(path)
+        p.drawLine(QPointF(r.right() - 7, r.top() + 11), QPointF(r.right() - 7, r.top() + 4))
+        p.drawLine(QPointF(r.right() - 7, r.top() + 11), QPointF(r.right() - 14, r.top() + 12))
+
+
+def _draw_room(p: QPainter, r: QRectF, c: QColor):
+    from PySide6.QtGui import QPolygonF
+    fill = QColor(c)
+    fill.setAlpha(60)
+    p.setBrush(fill)
+    p.drawPolygon(QPolygonF([QPointF(r.left() + 4, r.top() + 5), QPointF(r.right() - 4, r.top() + 5),
+                             QPointF(r.right() - 4, r.bottom() - 9), QPointF(r.center().x(), r.bottom() - 9),
+                             QPointF(r.center().x(), r.bottom() - 4), QPointF(r.left() + 4, r.bottom() - 4)]))
+    p.setBrush(c)
+    p.drawEllipse(QPointF(r.center().x() - 3, r.center().y() - 2), 2.2, 2.2)
+
+
 _DRAWERS.update({
+    "room": _draw_room,
+    "undo": _draw_undo,
+    "redo": lambda p, r, c: _draw_undo(p, r, c, True),
     "dimension": _draw_dimension,
     "arrow": _draw_arrow,
     "cloud": _draw_cloud,

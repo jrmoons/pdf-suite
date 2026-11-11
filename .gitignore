@@ -10,3 +10,4 @@ dist/
 
 # Unrelated project (its own git repo) that ended up nested in this folder
 suggestions-personnel/
+dist_new/

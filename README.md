@@ -43,6 +43,8 @@ n'est jamais écrasé (nom proposé : `…_modifié.pdf`).
 - **Sélection** : cliquer un objet puis touche **Suppr** pour l'effacer.
 - **Couleur** : la fenêtre de couleur reste ouverte, chaque couleur cliquée
   s'applique tout de suite (on peut surligner sans valider).
+- **Notes** : le texte s'affiche dans une bulle à côté de l'icône ; double-clic
+  pour le modifier, glisser pour la déplacer.
 - **Commentaires** : surligner (les espaces entre les mots aussi), souligner, barrer, texte libre, note, dessin,
   rectangle, ellipse, ligne, **flèche**, **nuage de révision**, **légende**
   (texte + trait vers le point visé, pointe déplaçable), **tampons de chantier**
@@ -50,7 +52,18 @@ n'est jamais écrasé (nom proposé : `…_modifié.pdf`).
   avec la date du jour et le nom Windows), gomme, couleur.
   Les formes, flèches, nuages, légendes et tampons sont des objets vectoriels
   déplaçables (clic droit → Verrouiller / Supprimer).
+- **Annuler / Rétablir** : Ctrl+Z / Ctrl+Y (boutons dans Accueil) pour toutes
+  les actions : annotations, cotes, mesures, texte modifié, pages…
 - **Mesures (plans)** :
+  - **Pièce auto** : un clic dans une pièce → contour, périmètre, surface et
+    cotes de chaque mur avec les portes et fenêtres (chaîne mur / ouverture /
+    mur + longueur totale), le tout en une étape annulable. Nécessite un plan
+    exporté **avec ses calques** (calques « Mur », « Poteau », « Macro de
+    fenêtre, porte »… — c'est le cas des exports DAO courants). Testé sur un
+    plan réel : surfaces à 97–99,7 % des valeurs indiquées sur le plan ;
+  - **Cotes auto** (case de la barre Mesure) : après un contour Périmètre /
+    Surface cliqué à la main, les cotes de chaque mur et les ouvertures sont
+    posées automatiquement (y compris sur un plan sans calques) ;
   - **Cote** (outil principal) : clic sur A, clic sur B (ou glisser de A à B,
     Maj = 0° / 45° / 90°), puis déplacer la souris pour **décaler la cote**
     et cliquer pour la poser — lignes de rappel, traits obliques, longueur
@@ -90,7 +103,6 @@ n'est jamais écrasé (nom proposé : `…_modifié.pdf`).
 
 ## Limitations connues / à venir
 
-- Pas encore d'annuler / refaire (prochain lot).
 - Texte libre et note : pas encore déplaçables.
 - Comparaison : pas de recalage automatique (plans supposés superposables).
 - Lots suivants prévus : indispensables (annuler/refaire, combiner, compresser,

@@ -28,6 +28,15 @@
   spatial, préparé au repos) ; `view.snap_to_grid` = interrupteur « Aimanter ». Échelle par
   défaut 1:50 en mémoire seulement (`scale_is_default`), pas écrite tant que non modifiée.
   Textes Qt en français : `main.install_french` (qtbase_fr.qm).
+- Annuler/Rétablir = journal MuPDF (`PdfDocument.op()`, `_OPS` en bas de pdf_document.py) :
+  TOUTE modification du PDF doit passer par une méthode de PdfDocument (sinon erreur « Can't
+  alter an object other than in an operation »). `new_page`/`insert_pdf` refusés par le journal
+  → `_swap_op` (copie du document). Copier des pages DEPUIS le document journalisé est refusé
+  → `_plain_copy()`.
+- Pièce auto = `room_detect.py` (numpy) : murs = éléments des CALQUES dont le nom contient
+  mur/poteau/…, portes/fenêtres = calque « porte/fenêtre » (traits droits = seuils), arcs de
+  porte ignorés. Plan sans calques → refus expliqué (la détection par image a été essayée et
+  abandonnée : cotes et cloisons tracées pareil). Validé sur le plan réel Arlon RDC (1:50).
 - Cote = `DimensionItem` (annotation_items), stockée en PolyLine A, A', B', B,
   subject `pdfsuite:measure_dimension`.
 - Texte modifié : `replace_text_in_rect` réécrit à l'origine/couleur/direction du span

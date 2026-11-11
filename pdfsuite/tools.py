@@ -25,6 +25,7 @@ class Tool(Enum):
     STAMP = auto()
     CAPTURE = auto()
     DIMENSION = auto()      # cote : A, B, puis décalage
+    ROOM = auto()           # pièce automatique : un clic dans la pièce
 
 
 DRAG_TOOLS = {Tool.HIGHLIGHT, Tool.UNDERLINE, Tool.STRIKEOUT, Tool.RECT,

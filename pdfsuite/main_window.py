@@ -151,6 +151,9 @@ class MainWindow(QMainWindow):
         Tool.ERASER: ("Gomme", "eraser", False, None),
         Tool.TEXTEDIT: ("Modifier texte", "textedit", False, None),
         Tool.SIGNATURE: ("Signature", "signature", False, None),
+        Tool.ROOM: ("Pièce auto", "room", False,
+                    "Cliquez dans une pièce : contour, périmètre, surface, cotes des murs "
+                    "avec portes et fenêtres (plans exportés avec leurs calques)"),
         Tool.DIMENSION: ("Cote", "dimension", False,
                          "Clic A, clic B, puis déplacez pour décaler la cote et cliquez (Maj = angle droit)"),
         Tool.MEASURE_LINE: ("Longueur", "measure_line", False, "Mesurer une ligne"),
@@ -172,6 +175,11 @@ class MainWindow(QMainWindow):
         self.act_save = self._act("Enregistrer sous", self.save_current, "save",
                                   shortcut=QKeySequence.Save,
                                   tip="Enregistre une copie : le fichier d'origine n'est jamais modifié")
+        self.act_undo = self._act("Annuler", self.undo, "undo", shortcut=QKeySequence.Undo,
+                                  tip="Annuler la dernière action (Ctrl+Z)")
+        self.act_redo = self._act("Rétablir", self.redo, "redo",
+                                  tip="Rétablir l'action annulée (Ctrl+Y)")
+        self.act_redo.setShortcuts([QKeySequence("Ctrl+Y"), QKeySequence("Ctrl+Shift+Z")])
         self.act_close_tab = self._act("Fermer l'onglet",
                                        lambda: self.close_tab(self.tabs.currentIndex()),
                                        shortcut=QKeySequence.Close)
@@ -264,6 +272,9 @@ class MainWindow(QMainWindow):
         for a in (self.act_open, self.act_save):
             home.addAction(a)
         home.addSeparator()
+        home.addAction(self.act_undo)
+        home.addAction(self.act_redo)
+        home.addSeparator()
         home.addAction(t[Tool.SELECT])
         home.addAction(t[Tool.PAN])
         home.addSeparator()
@@ -303,7 +314,7 @@ class MainWindow(QMainWindow):
         measures = self.ribbon.add_page("Mesures")
         measures.addAction(t[Tool.SELECT])
         measures.addSeparator()
-        for tool in (Tool.DIMENSION, Tool.MEASURE_PERIMETER, Tool.MEASURE_AREA):
+        for tool in (Tool.ROOM, Tool.DIMENSION, Tool.MEASURE_PERIMETER, Tool.MEASURE_AREA):
             measures.addAction(t[tool])
         measures.addAction(self.act_scale)
         measures.addSeparator()
@@ -346,6 +357,7 @@ class MainWindow(QMainWindow):
         self.addToolBar(self.measure_holder)
         self.measure_bar.applied.connect(self._on_measure_settings)
         self.measure_bar.colorChanged.connect(self._on_measure_color)
+        self.measure_bar.auto_cotes.toggled.connect(self._on_auto_cotes)
         self.measure_bar.calibrateRequested.connect(self.start_calibration)
 
         self.ribbon.set_current(int(self.settings.value("ribbon_tab", 0, type=int)))
@@ -404,6 +416,7 @@ class MainWindow(QMainWindow):
         for a in self._doc_actions:
             a.setEnabled(has_doc)
         self.stamp_combo.setEnabled(has_doc)
+        self._update_undo_actions()
         for w in (self.btn_prev, self.btn_next, self.page_spin, self.btn_zoom_in,
                   self.btn_zoom_out, self.zoom_slider, self.zoom_combo):
             w.setEnabled(has_doc)
@@ -531,6 +544,7 @@ class MainWindow(QMainWindow):
         view.set_rulers(self.act_rulers.isChecked())
         view.set_gpu(self.act_gpu.isChecked())
         view.snap_to_grid = self.act_snap.isChecked()
+        view.auto_cotes = self.measure_bar.auto_cotes.isChecked()
         view.filesDropped.connect(self.open_files)
         view.scaleRequired.connect(self._on_scale_required)
         view.scaleCalibrated.connect(lambda t=tab: self._on_measure_settings())
@@ -645,6 +659,12 @@ class MainWindow(QMainWindow):
             for v in self.tabs.widget(i).views():
                 v.set_measure_color(rgb)
 
+    def _on_auto_cotes(self, checked: bool):
+        self.settings.setValue("auto_cotes", checked)
+        for i in range(self.tabs.count()):
+            for v in self.tabs.widget(i).views():
+                v.auto_cotes = checked
+
     def _on_scale_required(self):
         self.measure_holder.setVisible(True)
         self.measure_bar.flash_warning()
@@ -657,6 +677,50 @@ class MainWindow(QMainWindow):
         for v in tab.views():
             v.start_calibration()
 
+    # -- Annuler / Rétablir ---------------------------------------------
+    def _update_undo_actions(self):
+        tab = self.current_tab()
+        doc = tab.pdf_document if tab else None
+        can_u = bool(doc and doc.can_undo())
+        can_r = bool(doc and doc.can_redo())
+        self.act_undo.setEnabled(can_u)
+        self.act_redo.setEnabled(can_r)
+        self.act_undo.setToolTip(f"Annuler : {doc.undo_name()} (Ctrl+Z)" if can_u else "Rien à annuler")
+        self.act_redo.setToolTip(f"Rétablir : {doc.redo_name()} (Ctrl+Y)" if can_r else "Rien à rétablir")
+
+    def undo(self):
+        self._history_step(undo=True)
+
+    def redo(self):
+        self._history_step(undo=False)
+
+    def _history_step(self, undo: bool):
+        tab = self.current_tab()
+        if tab is None:
+            return
+        doc = tab.pdf_document
+        name = doc.undo_name() if undo else doc.redo_name()
+        for v in tab.views():
+            v._cancel_polygon()
+            v._cancel_dimension()
+        kind = doc.undo() if undo else doc.redo()
+        if kind is None:
+            return
+        if kind == "annot":
+            for v in tab.views():
+                v.rebuild_annotations()
+        else:
+            doc.invalidate_render()
+            for v in tab.views():
+                v.refresh_all()
+            if kind == "pages":
+                tab.thumbnails.rebuild(doc)
+        self.measure_bar.apply_defaults(doc)      # back to 1:50 if the scale was undone
+        self.measure_bar.refresh()
+        self._on_doc_modified(tab)
+        self._update_page_label(tab.view.current_page())
+        self.statusBar().showMessage(("Annulé : " if undo else "Rétabli : ") + name, 4000)
+
     def _on_doc_modified(self, tab: DocumentTab, source_view: PdfGraphicsView | None = None):
         idx = self.tabs.indexOf(tab)
         title = self.tabs.tabText(idx)
@@ -667,6 +731,7 @@ class MainWindow(QMainWindow):
             if v is not source_view and source_view is not None:
                 v.refresh_all()
         self._update_scale_label()
+        self._update_undo_actions()
 
     def _suggest_save_path(self, tab: DocumentTab) -> str:
         doc = tab.pdf_document

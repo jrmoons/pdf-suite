@@ -353,6 +353,14 @@ class MarkupItem(QGraphicsObject):
 
 
 class NoteItem(QGraphicsObject):
+    """Sticky note: the icon AND its text are visible (yellow bubble next to
+    the icon, constant size on screen). Drag to move, double-click to edit,
+    right click / Suppr to delete."""
+
+    TEXT_PX = 13
+    ICON_PX = 18
+    MAX_W_PX = 260
+
     def __init__(self, view, page_no: int, annot, point: QPointF, content: str):
         super().__init__()
         self.view = view
@@ -360,34 +368,108 @@ class NoteItem(QGraphicsObject):
         self.annot = annot
         self.point = point
         self.content = content
-        self.setScale(view.scene_scale)
+        self.locked = False
         self.setZValue(9)
         self.setFlag(QGraphicsItem.ItemIsSelectable, True)
+        self.setFlag(QGraphicsItem.ItemIsMovable, True)
+        self.setCursor(Qt.SizeAllCursor)
         self.setToolTip(content)
 
-    SIZE = 16
+    def _k(self) -> float:
+        return 1.0 / max(self.view.zoom, 1e-6)
+
+    def _font(self) -> QFont:
+        f = QFont("Arial")
+        f.setPixelSize(self.TEXT_PX)
+        return f
+
+    def _bubble_px(self) -> QRectF:
+        """Bubble size in screen pixels (text wrapped)."""
+        fm = QFontMetricsF(self._font())
+        r = fm.boundingRect(QRectF(0, 0, self.MAX_W_PX, 10000),
+                            Qt.TextWordWrap, self.content or " ")
+        return QRectF(0, 0, r.width() + 14, r.height() + 10)
+
+    def _geometry(self):
+        k = self._k()
+        icon = QRectF(self.point.x(), self.point.y(), self.ICON_PX * k, self.ICON_PX * k)
+        b = self._bubble_px()
+        bubble = QRectF(icon.right() + 4 * k, icon.top(), b.width() * k, b.height() * k)
+        return icon, bubble
 
     def boundingRect(self) -> QRectF:
-        s = self.SIZE
-        return QRectF(self.point.x(), self.point.y(), s, s)
+        icon, bubble = self._geometry()
+        return icon.united(bubble).adjusted(-2 * self._k(), -2 * self._k(), 2 * self._k(), 2 * self._k())
 
     def paint(self, painter, option, widget=None):
-        r = self.boundingRect()
-        painter.setPen(QPen(QColor(40, 40, 40), 1))
+        icon, bubble = self._geometry()
+        k = self._k()
+        pen = QPen(QColor(150, 120, 0), 1)
+        pen.setCosmetic(True)
+        painter.setPen(pen)
         painter.setBrush(QBrush(QColor(255, 224, 102)))
-        painter.drawRoundedRect(r, 2, 2)
+        painter.drawRoundedRect(icon, 2 * k, 2 * k)
         for i in range(3):
-            y = r.top() + 4 + i * 3
-            painter.drawLine(QPointF(r.left() + 3, y), QPointF(r.right() - 3, y))
+            y = icon.top() + icon.height() * (0.3 + i * 0.2)
+            painter.drawLine(QPointF(icon.left() + icon.width() * 0.2, y),
+                             QPointF(icon.right() - icon.width() * 0.2, y))
+        painter.setBrush(QBrush(QColor(255, 247, 196, 245)))
+        if self.isSelected():
+            sel = QPen(QColor(47, 111, 237), 2)
+            sel.setCosmetic(True)
+            painter.setPen(sel)
+        painter.drawRoundedRect(bubble, 4 * k, 4 * k)
+        painter.save()
+        painter.translate(bubble.topLeft())
+        painter.scale(k, k)
+        painter.setFont(self._font())
+        painter.setPen(QPen(QColor(40, 40, 40)))
+        b = self._bubble_px()
+        painter.drawText(b.adjusted(7, 5, -7, -5), Qt.TextWordWrap, self.content)
+        painter.restore()
+
+    def zoom_changed(self):
+        self.prepareGeometryChange()
+        self.update()
+
+    def mouseReleaseEvent(self, event):
+        super().mouseReleaseEvent(event)
+        d = self.pos()
+        if self.locked or (abs(d.x()) < 0.01 and abs(d.y()) < 0.01):
+            return
+        self.prepareGeometryChange()
+        self.point = self.point + d
+        self.setPos(0, 0)
+        self._sync_to_pdf()
+
+    def mouseDoubleClickEvent(self, event):
+        from PySide6.QtWidgets import QInputDialog
+        text, ok = QInputDialog.getMultiLineText(None, "Modifier la note", "Texte :", self.content)
+        if ok:
+            self.prepareGeometryChange()
+            self.content = text
+            self.setToolTip(text)
+            self._sync_to_pdf()
+        event.accept()
+
+    def _sync_to_pdf(self):
+        page = self.view.doc.page(self.page_no)
+        self.annot = self.view.doc.update_note(self.page_no, self.annot, to_pdf(self.point, page),
+                                               self.content)
+        self.update()
+        self.view.documentModified.emit()
 
     def contextMenuEvent(self, event):
-        def delete():
+        menu = QMenu()
+        act_edit = menu.addAction("Modifier le texte…")
+        act_del = menu.addAction("Supprimer")
+        chosen = menu.exec(event.screenPos())
+        if chosen is act_edit:
+            self.mouseDoubleClickEvent(event)
+        elif chosen is act_del:
             self.view.doc.delete_annot(self.page_no, self.annot)
             self.view.remove_annotation_item(self.page_no, self)
             self.view.documentModified.emit()
-
-        menu = _build_menu(self.view, False, None, delete)
-        menu.exec(event.screenPos())
         event.accept()
 
 
@@ -409,7 +491,7 @@ class FreeTextItem(QGraphicsObject):
 
     def paint(self, painter, option, widget=None):
         painter.setPen(QPen(_qcolor(self.color_tuple)))
-        font = QFont()
+        font = QFont("Arial")
         font.setPointSizeF(11)
         painter.setFont(font)
         painter.drawText(QRectF(self.rect), Qt.TextWordWrap, self.text)
@@ -431,7 +513,7 @@ class MeasureItemBase(QGraphicsObject):
     on-screen width) and the label keeps a constant on-screen size."""
 
     subject = "pdfsuite:measure_line"
-    LABEL_PX = 12          # label font size on screen, whatever the zoom
+    LABEL_PX = 15          # label font size on screen, whatever the zoom
 
     def __init__(self, view, page_no: int, annot, points: list[QPointF], color, label: str):
         super().__init__()
@@ -454,7 +536,7 @@ class MeasureItemBase(QGraphicsObject):
         return 1.0 / max(self.view.zoom, 1e-6)
 
     def _font(self) -> QFont:
-        f = QFont()
+        f = QFont("Arial")
         f.setPixelSize(self.LABEL_PX)
         f.setBold(True)
         return f
@@ -652,7 +734,7 @@ class DimensionItem(QGraphicsObject):
     offset); drag the A / B handles to move the measured points."""
 
     subject = "pdfsuite:measure_dimension"
-    LABEL_PX = 12
+    LABEL_PX = 16
     GAP_PX = 3          # gap between measured point and extension line
     OVER_PX = 6         # extension line overshoot past the dimension line
     TICK_PX = 6
@@ -699,7 +781,7 @@ class DimensionItem(QGraphicsObject):
                                                           (self.b.x(), self.b.y())])
 
     def _font(self) -> QFont:
-        f = QFont()
+        f = QFont("Arial")
         f.setPixelSize(self.LABEL_PX)
         f.setBold(True)
         return f
@@ -1239,7 +1321,7 @@ class WidgetDisplayItem(QGraphicsObject):
         if not self.text:
             return
         painter.setPen(QPen(QColor(20, 20, 20)))
-        font = QFont()
+        font = QFont("Arial")
         font.setPointSizeF(max(8.0, self.rect.height() * 0.6))
         painter.setFont(font)
         painter.drawText(self.rect.adjusted(3, 0, -3, 0), Qt.AlignVCenter | Qt.TextSingleLine, self.text)

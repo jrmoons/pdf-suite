@@ -85,6 +85,12 @@ class MeasureBar(QFrame):
         self.color_btn = QPushButton("Couleur")
         self.color_btn.setToolTip("Couleur des nouvelles mesures")
         lay.addWidget(self.color_btn)
+        from PySide6.QtWidgets import QCheckBox
+        self.auto_cotes = QCheckBox("Cotes auto")
+        self.auto_cotes.setToolTip("Pièce auto / Périmètre / Surface : poser aussi les cotes de "
+                                   "chaque mur, avec les portes et fenêtres")
+        self.auto_cotes.setChecked(bool(self.settings.value("auto_cotes", True, type=bool)))
+        lay.addWidget(self.auto_cotes)
         self.calib_btn = QPushButton("Calibrer…")
         self.calib_btn.setToolTip("Tracer une ligne sur une cote connue du plan pour en déduire l'échelle")
         lay.addWidget(self.calib_btn)
@@ -163,6 +169,10 @@ class MeasureBar(QFrame):
         paper, real = self.paper.value(), self.real.value()
         if paper <= 0 or real <= 0:
             return
+        with self.doc.op("Échelle"):
+            self._apply_scale_inner(paper, real)
+
+    def _apply_scale_inner(self, paper, real):
         self.doc.unit = self.real_unit.currentText()
         self.doc.set_paper_real_scale(paper, self.paper_unit.currentText(),
                                       real, self.real_unit.currentText())
@@ -172,6 +182,10 @@ class MeasureBar(QFrame):
     def _on_unit_changed(self):
         if self.doc is None:
             return
+        with self.doc.op("Unité"):
+            self._on_unit_changed_inner()
+
+    def _on_unit_changed_inner(self):
         unit = self.real_unit.currentText()
         if self.doc.ratio():
             # same scale, values re-expressed in the new unit
@@ -188,17 +202,19 @@ class MeasureBar(QFrame):
             return
         n = SCALE_PRESETS[index - 1]
         self.presets.setCurrentIndex(0)
-        self.doc.unit = self.real_unit.currentText()
-        self.doc.set_ratio_scale(n)
-        self.doc.scale_is_default = False
-        self._done()
+        with self.doc.op("Échelle"):
+            self.doc.unit = self.real_unit.currentText()
+            self.doc.set_ratio_scale(n)
+            self.doc.scale_is_default = False
+            self._done()
 
     def _on_precision(self, index: int):
         if self.doc is None:
             return
-        self.doc.decimals = PRECISIONS[index][1]
-        self.settings.setValue("measure_decimals", PRECISIONS[index][1])
-        self._done()
+        with self.doc.op("Précision"):
+            self.doc.decimals = PRECISIONS[index][1]
+            self.settings.setValue("measure_decimals", PRECISIONS[index][1])
+            self._done()
 
     def _done(self):
         self.settings.setValue("measure_unit", self.doc.unit)

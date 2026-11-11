@@ -44,6 +44,10 @@ class PdfDocument:
             if not password or not self.doc.authenticate(password):
                 raise PermissionError("password-required")
         self._page_cache: dict[int, pymupdf.Page] = {}
+        self._history: list[dict] = []     # undo / redo entries (see "history")
+        self._hpos = 0
+        self._op_depth = 0
+        self._enable_journal(self.doc)
         # Real-world scale of the plan, in PDF points per metre. Read from
         # the file when it was saved by PDF Suite, otherwise asked once.
         self._scale: float | None = self._read_scale()
@@ -52,6 +56,7 @@ class PdfDocument:
         self._page_cache = {}
         self._dl_cache = {}
         self._snap_cache = {}
+        self._seg_cache = {}
 
     # -- object snapping ----------------------------------------------------
     SNAP_CELL = 24.0     # spatial hash cell, in PDF points
@@ -107,6 +112,87 @@ class PdfDocument:
         self._snap_cache[index] = grid
         return grid
 
+    def segments(self, index: int, layer_words=None):
+        """Straight segments of the drawing (visual coords), cached; with
+        ``layer_words``, only those on a layer whose name contains one."""
+        if not hasattr(self, "_seg_cache"):
+            self._seg_cache = {}
+        key = (index, tuple(layer_words) if layer_words else None)
+        segs = self._seg_cache.get(key)
+        if segs is not None:
+            return segs
+        page = self.page(index)
+        m = ~page.derotation_matrix if page.rotation else None
+        segs = []
+        try:
+            drawings = page.get_cdrawings()
+        except Exception:
+            drawings = []
+        for path in drawings:
+            if layer_words:
+                lname = (path.get("layer") or "").lower()
+                if not any(w in lname for w in layer_words):
+                    continue
+            for it in path.get("items", ()):
+                pts = None
+                if it[0] == "l":
+                    pts = [(it[1], it[2])]
+                elif it[0] == "re":
+                    r = pymupdf.Rect(it[1])
+                    c = [(r.x0, r.y0), (r.x1, r.y0), (r.x1, r.y1), (r.x0, r.y1)]
+                    pts = [(c[i], c[(i + 1) % 4]) for i in range(4)]
+                elif it[0] == "qu":
+                    q = it[1]
+                    c = [q[0], q[1], q[3], q[2]]
+                    pts = [(c[i], c[(i + 1) % 4]) for i in range(4)]
+                for a, b in pts or ():
+                    if m is not None:
+                        a, b = pymupdf.Point(a) * m, pymupdf.Point(b) * m
+                    segs.append((float(a[0]), float(a[1]), float(b[0]), float(b[1])))
+        self._seg_cache[key] = segs
+        return segs
+
+    def wall_openings(self, index: int, a, b, tol: float, min_gap: float, layer_words=None):
+        """Openings along the wall face A-B: parts of A-B NOT covered by a
+        collinear line of the drawing (doors and windows interrupt the wall
+        face line). Returns [(t0, t1)] distances from A, in points."""
+        import math
+        ax, ay = a
+        bx, by = b
+        L = math.hypot(bx - ax, by - ay)
+        if L < 1e-6:
+            return []
+        ux, uy = (bx - ax) / L, (by - ay) / L
+        xmin, xmax = min(ax, bx) - tol, max(ax, bx) + tol
+        ymin, ymax = min(ay, by) - tol, max(ay, by) + tol
+        cover = []
+        for x0, y0, x1, y1 in self.segments(index, layer_words):
+            if max(x0, x1) < xmin or min(x0, x1) > xmax or max(y0, y1) < ymin or min(y0, y1) > ymax:
+                continue
+            # both ends on the line A-B (perpendicular distance <= tol)
+            d0 = abs((x0 - ax) * uy - (y0 - ay) * ux)
+            d1 = abs((x1 - ax) * uy - (y1 - ay) * ux)
+            if d0 > tol or d1 > tol:
+                continue
+            t0 = (x0 - ax) * ux + (y0 - ay) * uy
+            t1 = (x1 - ax) * ux + (y1 - ay) * uy
+            if t0 > t1:
+                t0, t1 = t1, t0
+            t0, t1 = max(0.0, t0), min(L, t1)
+            if t1 - t0 > 1e-3:
+                cover.append((t0, t1))
+        cover.sort()
+        gaps, pos = [], 0.0
+        for t0, t1 in cover:
+            if t0 - pos >= min_gap:
+                gaps.append((pos, t0))
+            pos = max(pos, t1)
+        if L - pos >= min_gap:
+            gaps.append((pos, L))
+        if not cover:
+            return []          # no wall line found at all: do not guess
+        return gaps
+
     def snap_point(self, index: int, x: float, y: float, radius: float):
         """Nearest snap point within ``radius`` (visual coords), ends and
         corners preferred over midpoints. Returns (x, y, kind) or None."""
@@ -134,9 +220,11 @@ class PdfDocument:
         if index is None:
             self._dl_cache = {}
             self._snap_cache = {}
+            self._seg_cache = {}
         else:
             self._dl_cache.pop(index, None)
             getattr(self, "_snap_cache", {}).pop(index, None)
+            self._seg_cache = {}
 
     def display_list(self, index: int):
         """Parsed drawing of a page (content only, no annotations), cached:
@@ -158,6 +246,135 @@ class PdfDocument:
             return page.get_pixmap(matrix=pymupdf.Matrix(zoom, zoom), clip=clip,
                                    alpha=False, annots=False)
         return self.display_list(index).get_pixmap(matrix=mat, clip=clip, alpha=False)
+
+    # -- history: Annuler / Rétablir ---------------------------------------
+    # Every change to the PDF happens inside a named *operation* of the
+    # MuPDF journal, so Ctrl+Z undoes exactly one user action. Two page
+    # operations are not supported by the journal (insert a blank page,
+    # insert a PDF): for those the whole document is swapped for a modified
+    # copy and undo swaps it back.
+    MAX_SWAPS = 15
+
+    @staticmethod
+    def _enable_journal(doc):
+        try:
+            if doc.is_pdf and not doc.journal_is_enabled():
+                doc.journal_enable()
+        except Exception:
+            pass
+
+    def _journal_on(self) -> bool:
+        try:
+            return bool(self.doc.journal_is_enabled())
+        except Exception:
+            return False
+
+    class _Op:
+        def __init__(self, owner, name, kind):
+            self.owner, self.name, self.kind = owner, name, kind
+
+        def __enter__(self):
+            o = self.owner
+            if o._op_depth == 0 and o._journal_on():
+                o.doc.journal_start_op(self.name)
+                self.started = True
+            else:
+                self.started = False
+            o._op_depth += 1
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            o = self.owner
+            o._op_depth -= 1
+            if self.started:
+                o.doc.journal_stop_op()
+                o._push({"type": "journal", "name": self.name, "kind": self.kind})
+            return False
+
+    def op(self, name: str, kind: str = "annot"):
+        """``with doc.op("Surlignage"):`` groups changes into one undo step.
+        kind: "annot" (annotations only), "content" (page drawing changed),
+        "pages" (page structure), "doc" (document settings)."""
+        return PdfDocument._Op(self, name, kind)
+
+    def _push(self, entry: dict):
+        # a new action drops what could still be redone
+        for e in self._history[self._hpos:]:
+            if e["type"] == "swap" and e["new"] is not self.doc:
+                try:
+                    e["new"].close()
+                except Exception:
+                    pass
+        del self._history[self._hpos:]
+        self._history.append(entry)
+        self._hpos = len(self._history)
+        swaps = [e for e in self._history if e["type"] == "swap"]
+        if len(swaps) > self.MAX_SWAPS:
+            # forget the oldest history up to (and including) that swap
+            cut = self._history.index(swaps[0]) + 1
+            try:
+                swaps[0]["old"].close()
+            except Exception:
+                pass
+            del self._history[:cut]
+            self._hpos = len(self._history)
+
+    def _swap_op(self, name: str, fn):
+        """Run ``fn(new_doc)`` on a fresh copy of the document (for the
+        operations the journal cannot record), then switch to the copy."""
+        old = self.doc
+        fresh = pymupdf.open("pdf", old.tobytes())
+        fn(fresh)
+        self._enable_journal(fresh)
+        self.doc = fresh
+        self._invalidate_pages()
+        self._push({"type": "swap", "name": name, "kind": "pages", "old": old, "new": fresh})
+        self.mark_dirty()
+
+    def can_undo(self) -> bool:
+        return self._hpos > 0
+
+    def can_redo(self) -> bool:
+        return self._hpos < len(self._history)
+
+    def undo_name(self) -> str:
+        return self._history[self._hpos - 1]["name"] if self.can_undo() else ""
+
+    def redo_name(self) -> str:
+        return self._history[self._hpos]["name"] if self.can_redo() else ""
+
+    def undo(self) -> str | None:
+        """Undo the last action; returns its kind (or None)."""
+        if not self.can_undo():
+            return None
+        e = self._history[self._hpos - 1]
+        if e["type"] == "journal":
+            self.doc.journal_undo()
+        else:
+            self.doc = e["old"]
+        self._hpos -= 1
+        self._after_history()
+        return e["kind"]
+
+    def redo(self) -> str | None:
+        if not self.can_redo():
+            return None
+        e = self._history[self._hpos]
+        if e["type"] == "journal":
+            self.doc.journal_redo()
+        else:
+            self.doc = e["new"]
+        self._hpos += 1
+        self._after_history()
+        return e["kind"]
+
+    def _after_history(self):
+        self._invalidate_pages()
+        self._scale = self._read_scale() or (self._scale if getattr(self, "scale_is_default", False) else None)
+        for attr in ("_unit", "_decimals"):
+            if hasattr(self, attr):
+                delattr(self, attr)
+        self.mark_dirty()
 
     # -- measurement scale ----------------------------------------------
     def _read_scale(self) -> float | None:
@@ -395,9 +612,8 @@ class PdfDocument:
 
     # -- page manipulation --------------------------------------------
     def insert_blank_page(self, index: int, width: float = 595, height: float = 842):
-        self.doc.new_page(pno=index, width=width, height=height)
-        self._invalidate_pages()
-        self.mark_dirty()
+        self._swap_op("Page vierge",
+                      lambda d: d.new_page(pno=index, width=width, height=height))
 
     def delete_pages(self, indices: list[int]):
         for i in sorted(indices, reverse=True):
@@ -423,38 +639,45 @@ class PdfDocument:
         self.mark_dirty()
 
     def insert_pdf(self, other_path: str, at_index: int | None = None,
-                    from_page: int | None = None, to_page: int | None = None):
+                   from_page: int | None = None, to_page: int | None = None):
         src = pymupdf.open(other_path)
         try:
-            self.doc.insert_pdf(
+            self._swap_op("Insérer un PDF", lambda d: d.insert_pdf(
                 src,
                 from_page=from_page if from_page is not None else -1,
                 to_page=to_page if to_page is not None else -1,
                 start_at=at_index if at_index is not None else -1,
-            )
+            ))
         finally:
             src.close()
-        self._invalidate_pages()
-        self.mark_dirty()
+
+    def _plain_copy(self) -> pymupdf.Document:
+        """Copy without journal: copying pages *from* a journalled document
+        is refused by the PDF library (it touches the source form fields)."""
+        return pymupdf.open("pdf", self.doc.tobytes())
 
     def extract_pages(self, indices: list[int], out_path: str):
+        src = self._plain_copy()
         new_doc = pymupdf.open()
         for i in indices:
-            new_doc.insert_pdf(self.doc, from_page=i, to_page=i)
+            new_doc.insert_pdf(src, from_page=i, to_page=i)
         new_doc.save(out_path, deflate=True, garbage=3)
         new_doc.close()
+        src.close()
 
     def split_at(self, out_dir: str, base_name: str, ranges: list[tuple[int, int]]):
         """ranges: list of (start, end) inclusive, 0-based."""
         import os
         paths = []
+        src = self._plain_copy()
         for n, (a, b) in enumerate(ranges, start=1):
             new_doc = pymupdf.open()
-            new_doc.insert_pdf(self.doc, from_page=a, to_page=b)
+            new_doc.insert_pdf(src, from_page=a, to_page=b)
             out_path = os.path.join(out_dir, f"{base_name}_part{n}.pdf")
             new_doc.save(out_path, deflate=True, garbage=3)
             new_doc.close()
             paths.append(out_path)
+        src.close()
         return paths
 
     # -- annotations ------------------------------------------------------
@@ -831,6 +1054,90 @@ class PdfDocument:
         self.path = path
         self.dirty = False
 
+    def insert_image(self, index: int, rect, png_bytes: bytes):
+        self.page(index).insert_image(rect, stream=png_bytes, keep_proportion=True)
+        self.invalidate_render(index)
+        self.mark_dirty()
+
+    def set_widget_value(self, widget, value):
+        widget.field_value = value
+        widget.update()
+        self.mark_dirty()
+
+    def update_note(self, index: int, old_annot, point, text: str):
+        self.delete_annot(index, old_annot)
+        return self.add_note(index, point, text)
+
     # -- forms --------------------------------------------------------
     def widgets(self, index: int):
         return list(self.page(index).widgets() or [])
+
+
+
+# ---------------------------------------------------------------------------
+# One undo step per user action: wrap every method that changes the PDF.
+def _journaled(name: str, kind: str):
+    import functools
+
+    def deco(fn):
+        @functools.wraps(fn)
+        def wrapper(self, *args, **kwargs):
+            with self.op(name, kind):
+                return fn(self, *args, **kwargs)
+        return wrapper
+    return deco
+
+
+_OPS = {
+    # method: (label shown in "Annuler : …", kind)
+    "relabel_measurements": ("Mise à jour des mesures", "annot"),
+    "set_ratio_scale": ("Échelle", "annot"),
+    "set_paper_real_scale": ("Échelle", "annot"),
+    "delete_pages": ("Supprimer des pages", "pages"),
+    "rotate_page": ("Rotation de page", "pages"),
+    "move_page": ("Déplacer une page", "pages"),
+    "reorder_pages": ("Réordonner les pages", "pages"),
+    "add_highlight": ("Surlignage", "annot"),
+    "add_underline": ("Soulignement", "annot"),
+    "add_strikeout": ("Barré", "annot"),
+    "add_freetext": ("Texte libre", "annot"),
+    "add_note": ("Note", "annot"),
+    "update_note": ("Note modifiée", "annot"),
+    "add_ink": ("Dessin", "annot"),
+    "add_rect": ("Rectangle", "annot"),
+    "add_ellipse": ("Ellipse", "annot"),
+    "add_line": ("Ligne", "annot"),
+    "delete_annot": ("Suppression", "annot"),
+    "update_rect": ("Déplacement", "annot"),
+    "update_ellipse": ("Déplacement", "annot"),
+    "update_line": ("Déplacement", "annot"),
+    "update_ink": ("Déplacement", "annot"),
+    "add_measure_line": ("Mesure", "annot"),
+    "update_measure_line": ("Mesure modifiée", "annot"),
+    "add_dimension": ("Cote", "annot"),
+    "update_dimension": ("Cote modifiée", "annot"),
+    "add_measure_polygon": ("Mesure", "annot"),
+    "update_measure_polygon": ("Mesure modifiée", "annot"),
+    "add_cloud": ("Nuage", "annot"),
+    "update_cloud": ("Nuage modifié", "annot"),
+    "add_arrow": ("Flèche", "annot"),
+    "update_arrow": ("Flèche modifiée", "annot"),
+    "add_callout": ("Légende", "annot"),
+    "update_callout": ("Légende modifiée", "annot"),
+    "add_stamp": ("Tampon", "annot"),
+    "update_stamp": ("Tampon déplacé", "annot"),
+    "delete_annot_at": ("Gomme", "annot"),
+    "replace_text_in_rect": ("Modification de texte", "content"),
+    "insert_image": ("Signature / image", "content"),
+    "set_widget_value": ("Formulaire", "annot"),
+    "set_geom": ("Géométrie", "annot"),
+}
+for _name, (_label, _kind) in _OPS.items():
+    if hasattr(PdfDocument, _name):
+        setattr(PdfDocument, _name, _journaled(_label, _kind)(getattr(PdfDocument, _name)))
+
+# property setters that write into the PDF
+for _prop, _label in (("scale_points_per_meter", "Échelle"), ("unit", "Unité"),
+                      ("decimals", "Précision")):
+    _p = getattr(PdfDocument, _prop)
+    setattr(PdfDocument, _prop, property(_p.fget, _journaled(_label, "annot")(_p.fset)))

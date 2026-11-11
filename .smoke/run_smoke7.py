@@ -55,6 +55,7 @@ view = tab.view
 doc = tab.pdf_document
 view.refresh_page(0)
 item = view.page_items[0]
+win.measure_bar.auto_cotes.setChecked(False)   # this test counts only its own measures
 
 check("ribbon tabs", win.ribbon.page_titles() ==
       ["Accueil", "Commentaires", "Mesures", "Pages", "Protéger", "Affichage"],

@@ -35,7 +35,10 @@ BASE_MAX_PX = 2600        # longest side of a page's base image
 DETAIL_DELAY_MS = 120     # pause before the sharp tile is rendered
 MIN_ZOOM, MAX_ZOOM = 0.05, 16.0
 RULER = 22                # ruler thickness in pixels
-MEASURE_TOOLS = {Tool.MEASURE_LINE, Tool.MEASURE_PERIMETER, Tool.MEASURE_AREA, Tool.DIMENSION}
+MEASURE_TOOLS = {Tool.MEASURE_LINE, Tool.MEASURE_PERIMETER, Tool.MEASURE_AREA, Tool.DIMENSION,
+                 Tool.ROOM}
+COTE_OFFSET_M = (0.30, 0.65)    # automatic cotes: chain, then overall length
+MIN_COTE_SIDE_M = 0.30          # no automatic cote on shorter sides
 
 
 def _rect_to_quad(r: pymupdf.Rect) -> pymupdf.Quad:
@@ -233,6 +236,7 @@ class PdfGraphicsView(QGraphicsView):
         self._poly_points: list = []
         self._poly_preview_item = None
 
+        self.auto_cotes = True            # cotes + ouvertures automatiques sur les contours
         self.show_grid = False
         self.snap_to_grid = True          # « Aimanter » : points du plan (+ grille si affichée)
         self._snap_marker = None
@@ -380,20 +384,33 @@ class PdfGraphicsView(QGraphicsView):
             angle = event.angleDelta().y()
             if angle:
                 factor = 1.2 ** (angle / 120)
-                self.set_zoom(self.zoom * factor, under_mouse=True)
+                self.set_zoom(self.zoom * factor, anchor=event.position().toPoint())
             event.accept()
             return
         super().wheelEvent(event)
 
-    def set_zoom(self, zoom: float, under_mouse: bool = False):
+    def set_zoom(self, zoom: float, under_mouse: bool = False, anchor=None):
+        """Zoom keeping the point under ``anchor`` (viewport position; the
+        mouse when ``under_mouse``, else the centre) exactly where it is —
+        zooming in AND out stays on the place you are looking at."""
         zoom = max(MIN_ZOOM, min(MAX_ZOOM, zoom))
         if abs(zoom - self.zoom) < 1e-9:
             return
-        self.setTransformationAnchor(
-            QGraphicsView.AnchorUnderMouse if under_mouse else QGraphicsView.AnchorViewCenter)
-        self.setTransform(QTransform.fromScale(zoom, zoom))
-        self.setTransformationAnchor(QGraphicsView.AnchorUnderMouse)
+        vp_rect = self.viewport().rect()
+        if anchor is None and under_mouse:
+            from PySide6.QtGui import QCursor
+            anchor = self.viewport().mapFromGlobal(QCursor.pos())
+        if anchor is None or not vp_rect.contains(anchor):
+            anchor = vp_rect.center()
+        scene_pt = self.mapToScene(anchor)
+        self.setTransformationAnchor(QGraphicsView.NoAnchor)
+        self.setResizeAnchor(QGraphicsView.NoAnchor)
         self.zoom = zoom
+        self._update_scene_rect()
+        self.setTransform(QTransform.fromScale(zoom, zoom))
+        delta = self.mapFromScene(scene_pt) - anchor
+        self.horizontalScrollBar().setValue(self.horizontalScrollBar().value() + delta.x())
+        self.verticalScrollBar().setValue(self.verticalScrollBar().value() + delta.y())
         self.zoomChanged.emit(zoom)
         self._update_rulers()
         self._schedule_detail()
@@ -402,7 +419,9 @@ class PdfGraphicsView(QGraphicsView):
         if not self.page_items:
             return
         w = max(it.size.width() for it in self.page_items)
+        cur = self.current_page()
         self.set_zoom((self.viewport().width() - 24) / max(w, 1))
+        self.goto_page(cur)
 
     def fit_page(self):
         if not self.page_items:
@@ -410,7 +429,7 @@ class PdfGraphicsView(QGraphicsView):
         it = self.page_items[self.current_page()]
         vw, vh = self.viewport().width() - 24, self.viewport().height() - 24
         self.set_zoom(min(vw / it.size.width(), vh / it.size.height()))
-        self.goto_page(it.page_no)
+        self.centerOn(it.page_rect().center())
 
     # ------------------------------------------------------------------
     def build_scene(self, keep_page: int | None = None):
@@ -427,15 +446,25 @@ class PdfGraphicsView(QGraphicsView):
             self.page_items.append(item)
             self._rebuild_page_annotations(item)
             y += h + GAP
-        self._scene.setSceneRect(0, 0, max_w + 2 * GAP, y)
-        if keep_page is not None and 0 <= keep_page < len(self.page_items):
-            self.goto_page(keep_page)
+        self._content_rect = QRectF(0, 0, max_w + 2 * GAP, y)
+        self._update_scene_rect()
+        self.goto_page(keep_page if keep_page is not None and 0 <= keep_page < len(self.page_items) else 0)
         self._form_proxies = []
         self._snap_marker = None
         if self.form_mode:
             self._add_form_widgets()
         self._update_visible()
         QTimer.singleShot(400, self._prepare_snap)
+
+    def _update_scene_rect(self):
+        """Pages + a margin of one screen on each side: lets the view keep
+        the point under the mouse fixed when zooming out near an edge."""
+        r = getattr(self, "_content_rect", None)
+        if r is None:
+            return
+        mx = self.viewport().width() / self.zoom
+        my = self.viewport().height() / self.zoom
+        self._scene.setSceneRect(r.adjusted(-mx, -my, mx, my))
 
     # -- vector annotation layer ------------------------------------------
     def _rebuild_page_annotations(self, item: PageItem):
@@ -560,9 +589,7 @@ class PdfGraphicsView(QGraphicsView):
         return None
 
     def _commit_widget(self, widget_obj, value):
-        widget_obj.field_value = value
-        widget_obj.update()
-        self.doc.mark_dirty()
+        self.doc.set_widget_value(widget_obj, value)
         self.documentModified.emit()
 
     # -- navigation ---------------------------------------------------------
@@ -576,11 +603,18 @@ class PdfGraphicsView(QGraphicsView):
         return max(0, len(self.page_items) - 1)
 
     def goto_page(self, n: int):
+        """Page top at the top of the view, page centred horizontally (or
+        its left edge at the left when it is wider than the view)."""
         if 0 <= n < len(self.page_items):
             item = self.page_items[n]
-            vp = self.mapFromScene(QPointF(item.x(), item.y() - GAP / 2))
-            vbar = self.verticalScrollBar()
-            vbar.setValue(vbar.value() + vp.y())
+            vw = self.viewport().width() / self.zoom
+            if item.size.width() <= vw:
+                x = item.x() + item.size.width() / 2 - vw / 2
+            else:
+                x = item.x() - GAP / 2
+            vp = self.mapFromScene(QPointF(x, item.y() - GAP / 2))
+            self.horizontalScrollBar().setValue(self.horizontalScrollBar().value() + vp.x())
+            self.verticalScrollBar().setValue(self.verticalScrollBar().value() + vp.y())
 
     # -- rendering ----------------------------------------------------------
     def _render_zoom(self) -> float:
@@ -674,6 +708,7 @@ class PdfGraphicsView(QGraphicsView):
 
     def resizeEvent(self, event):
         super().resizeEvent(event)
+        self._update_scene_rect()
         self._place_rulers()
         self._update_visible()
 
@@ -905,6 +940,11 @@ class PdfGraphicsView(QGraphicsView):
 
         if self.tool == Tool.STAMP:
             self.place_stamp(page_no, pdf_pt)
+            return
+
+        if self.tool == Tool.ROOM:
+            local = scene_pos - item.pos()
+            self.auto_room(item, (local.x(), local.y()))
             return
 
         if self.tool in DRAG_TOOLS:
@@ -1158,7 +1198,12 @@ class PdfGraphicsView(QGraphicsView):
             return
         subject = "pdfsuite:measure_area" if self.tool == Tool.MEASURE_AREA else "pdfsuite:measure_perimeter"
         label = self.doc.measure_label(subject, points)
-        self.doc.add_measure_polygon(page_no, points, self.measure_color, label, subject)
+        with self.doc.op("Mesure de pièce"):
+            self.doc.add_measure_polygon(page_no, points, self.measure_color, label, subject)
+            if self.auto_cotes:
+                page = self.doc.page(page_no)
+                vis = [pymupdf.Point(p) * ~page.derotation_matrix for p in points]
+                self._add_room_cotes(page_no, [(p.x, p.y) for p in vis], None)
         self._cancel_polygon()
         self._rebuild_page_annotations(self.page_items[page_no])
         self.documentModified.emit()
@@ -1287,8 +1332,7 @@ class PdfGraphicsView(QGraphicsView):
         aspect = 0.4
         rect = pymupdf.Rect(pdf_pt.x, pdf_pt.y,
                             pdf_pt.x + width_pt, pdf_pt.y + width_pt * aspect)
-        page.insert_image(rect, stream=png_bytes, keep_proportion=True)
-        self.doc.mark_dirty()
+        self.doc.insert_image(page_no, rect, png_bytes)
         self.refresh_page(page_no, content_changed=True)
         self.documentModified.emit()
 
@@ -1543,4 +1587,103 @@ def _dim_methods():
 
 
 for _name, _fn in _dim_methods().items():
+    setattr(PdfGraphicsView, _name, _fn)
+
+
+# -- automatic room (Pièce auto) + automatic cotes -----------------------------
+def _room_methods():
+
+    def auto_room(self, item, click_visual):
+        """One click inside a room: outline, perimeter + area, cotes of
+        every wall with its doors / windows. One undo step."""
+        from . import room_detect as rd
+        QApplication.setOverrideCursor(Qt.WaitCursor)
+        try:
+            res = rd.detect_room(self.doc, item.page_no, click_visual)
+        except rd.RoomError as exc:
+            QApplication.restoreOverrideCursor()
+            self.statusMessage.emit(str(exc))
+            from PySide6.QtWidgets import QMessageBox
+            QMessageBox.information(self, "Pièce automatique", str(exc))
+            return
+        finally:
+            if QApplication.overrideCursor() is not None:
+                QApplication.restoreOverrideCursor()
+        poly = res["polygon"]
+        page = self.doc.page(item.page_no)
+        pdf_pts = [pymupdf.Point(p) * page.derotation_matrix for p in poly]
+        subject = "pdfsuite:measure_perimeter"
+        label = self.doc.measure_label(subject, pdf_pts)
+        with self.doc.op("Pièce automatique"):
+            self.doc.add_measure_polygon(item.page_no, pdf_pts, self.measure_color, label, subject)
+            if self.auto_cotes:
+                self._add_room_cotes(item.page_no, poly, res["openings"])
+        self._rebuild_page_annotations(item)
+        self.documentModified.emit()
+        doors = sum(1 for o in res["openings"] if o["kind"] == "porte")
+        wins = sum(1 for o in res["openings"] if o["kind"] == "fenêtre")
+        extra = []
+        if doors:
+            extra.append(f"{doors} porte" + ("s" if doors > 1 else ""))
+        if wins:
+            extra.append(f"{wins} fenêtre" + ("s" if wins > 1 else ""))
+        self.statusMessage.emit(f"Pièce : {label}" + (" · " + ", ".join(extra) if extra else ""))
+
+    def _add_room_cotes(self, page_no, poly, openings):
+        """Cotes inside the room along each side: the side's length, or a
+        chain wall / opening / wall plus the overall length when the side
+        has openings. ``openings`` None = detect them now."""
+        from . import room_detect as rd
+        if openings is None:
+            try:
+                openings = rd.find_openings(self.doc, page_no, poly)
+            except Exception:
+                openings = []
+        scale = self.doc.scale_points_per_meter or 1.0
+        d1, d2 = COTE_OFFSET_M[0] * scale, COTE_OFFSET_M[1] * scale
+        page = self.doc.page(page_no)
+        n = len(poly)
+        for i in range(n):
+            a, b = poly[i], poly[(i + 1) % n]
+            L = math.dist(a, b)
+            if L < MIN_COTE_SIDE_M * scale:
+                continue                           # door frames, small returns
+            ux, uy = (b[0] - a[0]) / L, (b[1] - a[1]) / L
+            nx, ny = uy, -ux                       # DimensionItem.normal()
+            mid = ((a[0] + b[0]) / 2, (a[1] + b[1]) / 2)
+            inside = 1.0 if rd.point_in_poly(mid[0] + nx * d1 * 0.5, mid[1] + ny * d1 * 0.5,
+                                              poly) else -1.0
+            ts = sorted((math.dist(a, o["a"]), math.dist(a, o["b"]))
+                        for o in openings if o["edge"] == i)
+            marks = [0.0]
+            for t0, t1 in ts:
+                marks += [min(t0, t1), max(t0, t1)]
+            marks.append(L)
+            # merge tiny pieces of the chain (< 10 cm) into their neighbour
+            kept = [marks[0]]
+            for t in marks[1:]:
+                if t - kept[-1] >= 0.10 * scale:
+                    kept.append(t)
+                elif t == marks[-1]:
+                    kept[-1] = t
+            marks = kept
+
+            def cote(t0, t1, off):
+                pa = QPointF(a[0] + ux * t0, a[1] + uy * t0)
+                pb = QPointF(a[0] + ux * t1, a[1] + uy * t1)
+                tmp = ai.DimensionItem(self, page_no, None, pa, pb, off * inside, self.measure_color)
+                self.doc.add_dimension(page_no, tmp.pdf_vertices(page), self.measure_color,
+                                       tmp._compute_label())
+
+            if len(marks) > 2:
+                for k in range(len(marks) - 1):
+                    cote(marks[k], marks[k + 1], d1)
+                cote(0.0, L, d2)
+            else:
+                cote(0.0, L, d1)
+
+    return {k: v for k, v in locals().items() if callable(v)}
+
+
+for _name, _fn in _room_methods().items():
     setattr(PdfGraphicsView, _name, _fn)
