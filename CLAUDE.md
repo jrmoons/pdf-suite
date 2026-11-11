@@ -10,6 +10,14 @@
 - Piège PyMuPDF : un seul objet `Page` par index (`PdfDocument._page_cache`). Ne jamais
   refaire des `doc[i]` répétés, sinon erreur « annotation not bound to any page ».
 - Annotations = items vectoriels Qt (`annotation_items.py`), page rendue avec `annots=False`.
+- Perf (2026-11-11) : `PageItem` n'est PAS rendu au zoom complet. Image de base plafonnée
+  (`BASE_MAX_PX`) étirée à la taille de la page + tuile nette de la zone visible au zoom exact
+  (`_render_pending`, différé `DETAIL_DELAY_MS`). Ctrl+molette = transformation de vue
+  instantanée puis `set_zoom` différé. Vignettes rendues une par une (QTimer).
+  Ne jamais revenir à un rendu pleine page au zoom (plans A0/A1 = centaines de Mo, secondes).
+  Plan lourd de test : `.smoke/make_heavy.py`.
+- Exe local = version dossier `dist\PDFSuite\PDFSuite.exe` (démarrage rapide, raccourci Bureau) ;
+  GitHub Actions produit toujours un exe fichier unique (portable).
 - Règle : ne citer aucun logiciel PDF tiers comme source ou inspiration (code, README, commits).
 - Préférences de Jérémy (2026-11-11) : implémenter les 52 idées par lots (testé + commit +
   push à chaque lot) ; ruban à onglets ; Ctrl+S = toujours « Enregistrer sous » (l'original

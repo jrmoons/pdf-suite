@@ -16,8 +16,8 @@ vers l'environnement virtuel `.venv` du projet)
 
 ### Exe autonome + raccourci sur le Bureau
 
-Double-cliquer sur `creer_raccourci.bat` : construit `dist\PDFSuite.exe`
-(PyInstaller) puis crée le raccourci « PDF Suite » sur le Bureau.
+Double-cliquer sur `creer_raccourci.bat` : construit `dist\PDFSuite\PDFSuite.exe`
+(PyInstaller, version dossier qui démarre vite) puis crée le raccourci « PDF Suite » sur le Bureau.
 L'exe est aussi construit automatiquement par GitHub Actions à chaque push
 (onglet Actions → artefact `PDFSuite-windows`).
 
@@ -32,8 +32,9 @@ n'est jamais écrasé (nom proposé : `…_modifié.pdf`).
 
 ## Fonctionnalités
 
-- **Visionneuse** : multi-onglets, défilement continu, zoom (Ctrl + molette
-  centré sur le curseur), vignettes réorganisables, thème clair / sombre.
+- **Visionneuse** : multi-onglets, défilement continu, zoom instantané
+  (Ctrl + molette centré sur le curseur) même sur de gros plans A0/A1 — seule
+  la zone visible est recalculée en haute définition, vignettes réorganisables, thème clair / sombre.
 - **Commentaires** : surligner, souligner, barrer, texte libre, note, dessin,
   rectangle, ellipse, ligne, **flèche**, **nuage de révision**, **légende**
   (texte + trait vers le point visé, pointe déplaçable), **tampons de chantier**
@@ -79,5 +80,6 @@ python -m venv .venv
 ```
 
 Tests de fumée (rendu hors écran, sans interface visible) dans `.smoke/` :
-`set QT_QPA_PLATFORM=offscreen` puis `.venv\Scripts\python .smokeun_smoke7.py`
+`set QT_QPA_PLATFORM=offscreen` puis `.venv\Scripts\python .smoke
+un_smoke7.py`
 (lancer `make_sample.py` d'abord pour les tests 1 à 6).

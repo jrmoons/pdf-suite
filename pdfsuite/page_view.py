@@ -5,10 +5,10 @@ import getpass
 import math
 
 import pymupdf
-from PySide6.QtCore import Qt, QPointF, QRectF, QRect, QSize, Signal
+from PySide6.QtCore import Qt, QPointF, QRectF, QRect, QSize, QSizeF, QTimer, Signal
 from PySide6.QtGui import QImage, QPixmap, QPen, QColor, QPainterPath, QBrush, QPainter
 from PySide6.QtWidgets import (
-    QGraphicsView, QGraphicsScene, QGraphicsPixmapItem, QGraphicsRectItem,
+    QGraphicsView, QGraphicsScene, QGraphicsItem, QGraphicsRectItem,
     QGraphicsEllipseItem, QGraphicsLineItem, QGraphicsPathItem, QInputDialog,
     QGraphicsProxyWidget, QLineEdit, QCheckBox, QComboBox, QDialog, QLabel,
     QApplication,
@@ -32,12 +32,47 @@ def pixmap_to_qpixmap(pix: pymupdf.Pixmap) -> QPixmap:
     return QPixmap.fromImage(img)
 
 
-class PageItem(QGraphicsPixmapItem):
-    def __init__(self, page_no: int):
+# Performance: a page is never rasterised at full zoom. It gets one *base*
+# image whose longest side is capped (BASE_MAX_PX), drawn stretched to the
+# page size - so zooming is instant - plus a sharp *detail* tile rendered at
+# the exact zoom for the visible part only, once scrolling/zooming pauses.
+BASE_MAX_PX = 2600
+DETAIL_DELAY_MS = 140
+
+
+class PageItem(QGraphicsItem):
+    def __init__(self, page_no: int, width_px: float, height_px: float):
         super().__init__()
         self.page_no = page_no
-        self.rendered = False
-        self.annot_items: list = []  # top-level vector items + their handles
+        self.size = QSizeF(width_px, height_px)
+        self.base: QPixmap | None = None
+        self.base_zoom = 0.0          # zoom the base image was rendered at
+        self.detail: QPixmap | None = None
+        self.detail_rect = QRectF()   # local (zoomed px) rect covered by detail
+        self.detail_zoom = 0.0
+        self.annot_items: list = []   # top-level vector items + their handles
+        self.setFlag(QGraphicsItem.ItemUsesExtendedStyleOption, True)
+
+    @property
+    def rendered(self) -> bool:
+        return self.base is not None
+
+    def page_rect(self) -> QRectF:
+        """Scene rect of the page."""
+        return QRectF(self.pos(), self.size)
+
+    def boundingRect(self) -> QRectF:
+        return QRectF(QPointF(0, 0), self.size)
+
+    def paint(self, painter, option, widget=None):
+        r = self.boundingRect()
+        painter.setRenderHint(QPainter.SmoothPixmapTransform, True)
+        if self.base is None:
+            painter.fillRect(r, QColor(255, 255, 255))
+        else:
+            painter.drawPixmap(r, self.base, QRectF(self.base.rect()))
+        if self.detail is not None and not self.detail_rect.isEmpty():
+            painter.drawPixmap(self.detail_rect, self.detail, QRectF(self.detail.rect()))
 
 
 class PdfGraphicsView(QGraphicsView):
@@ -61,7 +96,7 @@ class PdfGraphicsView(QGraphicsView):
         self._scene = QGraphicsScene(self)
         self.setScene(self._scene)
         self.setRenderHints(self.renderHints())
-        self.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
         self.setResizeAnchor(QGraphicsView.AnchorViewCenter)
         self.setBackgroundBrush(QBrush(QColor(60, 63, 68)))
         self.setFocusPolicy(Qt.StrongFocus)
@@ -113,12 +148,10 @@ class PdfGraphicsView(QGraphicsView):
                 event.accept()
                 return
             viewport_pos = event.position().toPoint()
-            fraction = self._fraction_at(viewport_pos)
             factor = 1.15 if angle > 0 else 1 / 1.15
-            new_zoom = max(0.2, min(6.0, self.zoom * factor))
-            self.set_zoom(new_zoom)
-            if fraction is not None:
-                self._recenter_on_fraction(*fraction, viewport_pos)
+            target = getattr(self, "_pending_zoom", None) or self.zoom
+            new_zoom = max(0.2, min(8.0, target * factor))
+            self._preview_zoom(new_zoom, viewport_pos)
             event.accept()
             return
         super().wheelEvent(event)
@@ -128,7 +161,7 @@ class PdfGraphicsView(QGraphicsView):
         item = self._item_at_scene(scene_pos)
         if item is None:
             return None
-        size = item.pixmap().size()
+        size = item.size
         if size.width() == 0 or size.height() == 0:
             return None
         local = scene_pos - item.pos()
@@ -138,12 +171,20 @@ class PdfGraphicsView(QGraphicsView):
         if not (0 <= page_no < len(self.page_items)):
             return
         item = self.page_items[page_no]
-        size = item.pixmap().size()
+        size = item.size
         target = item.pos() + QPointF(fx * size.width(), fy * size.height())
         self.verticalScrollBar().setValue(int(target.y() - viewport_pos.y()))
+        hbar = self.horizontalScrollBar()
+        if hbar.maximum() > 0:
+            hbar.setValue(int(target.x() - viewport_pos.x()))
 
     # ------------------------------------------------------------------
-    def build_scene(self, keep_page: int | None = None):
+    def build_scene(self, keep_page: int | None = None, reuse_images: bool = False):
+        # On a zoom change, keep the already-rendered base images: shown
+        # stretched right away, re-rendered later (debounced) only if the
+        # zoom changed a lot. Never reused when pages may have changed.
+        old_bases = {it.page_no: (it.base, it.base_zoom) for it in self.page_items
+                     if it.base is not None} if reuse_images else {}
         self._scene.clear()
         self.page_items = []
         max_w = 0.0
@@ -156,10 +197,9 @@ class PdfGraphicsView(QGraphicsView):
         y = GAP
         for i, (w, h) in enumerate(sizes):
             pw, ph = w * self.zoom, h * self.zoom
-            item = PageItem(i)
-            placeholder = QPixmap(max(1, int(pw)), max(1, int(ph)))
-            placeholder.fill(QColor(255, 255, 255))
-            item.setPixmap(placeholder)
+            item = PageItem(i, pw, ph)
+            if i in old_bases:
+                item.base, item.base_zoom = old_bases[i]
             item.setPos((max_w - pw) / 2, y)
             item.setZValue(0)
             self._scene.addItem(item)
@@ -170,7 +210,7 @@ class PdfGraphicsView(QGraphicsView):
         self._scene.setSceneRect(0, 0, max_w, y)
         if keep_page is not None and 0 <= keep_page < len(self.page_items):
             self.goto_page(keep_page)
-        self._update_visible()
+        self._update_visible(render_now=not old_bases)
         self._form_proxies = []
         if self.form_mode:
             self._add_form_widgets()
@@ -264,14 +304,45 @@ class PdfGraphicsView(QGraphicsView):
 
     def set_zoom(self, zoom: float):
         cur = self.current_page()
-        self.zoom = max(0.2, min(6.0, zoom))
-        self.build_scene(keep_page=cur)
+        self.resetTransform()
+        self._pending_zoom = None
+        self.zoom = max(0.2, min(8.0, zoom))
+        self.build_scene(keep_page=cur, reuse_images=True)
         self.zoomChanged.emit(self.zoom)
+
+    # Ctrl+wheel: scale the current picture instantly (view transform), and
+    # rebuild the scene at the real zoom only once the wheel stops.
+    def _preview_zoom(self, new_zoom: float, viewport_pos):
+        if getattr(self, "_pending_zoom", None) is None:
+            self._zoom_anchor = self._fraction_at(viewport_pos)
+        self._zoom_anchor_pos = viewport_pos
+        self._pending_zoom = new_zoom
+        self.setTransformationAnchor(QGraphicsView.AnchorUnderMouse)
+        k = new_zoom / self.zoom
+        self.setTransform(self.transform().fromScale(k, k))
+        self.setTransformationAnchor(QGraphicsView.AnchorViewCenter)
+        self.zoomChanged.emit(new_zoom)
+        if not hasattr(self, "_zoom_timer"):
+            self._zoom_timer = QTimer(self)
+            self._zoom_timer.setSingleShot(True)
+            self._zoom_timer.timeout.connect(self._commit_zoom)
+        self._zoom_timer.start(180)
+
+    def _commit_zoom(self):
+        new_zoom = getattr(self, "_pending_zoom", None)
+        if new_zoom is None:
+            return
+        anchor = getattr(self, "_zoom_anchor", None)
+        pos = self._zoom_anchor_pos
+        # where is the anchor now, on screen, under the preview transform?
+        self.set_zoom(new_zoom)
+        if anchor is not None:
+            self._recenter_on_fraction(*anchor, pos)
 
     def current_page(self) -> int:
         top = self.mapToScene(0, 0).y()
         for item in self.page_items:
-            if item.y() + item.pixmap().height() > top:
+            if item.y() + item.size.height() > top:
                 return item.page_no
         return max(0, len(self.page_items) - 1)
 
@@ -280,19 +351,77 @@ class PdfGraphicsView(QGraphicsView):
             item = self.page_items[n]
             self.verticalScrollBar().setValue(int(item.y()) - GAP)
 
+    def _base_zoom_for(self, n: int) -> float:
+        w, h = self.doc.visual_size(n)
+        return min(self.zoom, BASE_MAX_PX / max(w, h, 1))
+
+    def _to_qpixmap(self, pix) -> QPixmap:
+        qpix = pixmap_to_qpixmap(pix)
+        if self.invert_colors:
+            img = qpix.toImage()
+            img.invertPixels()
+            qpix = QPixmap.fromImage(img)
+        return qpix
+
     def refresh_page(self, n: int):
         """Re-render the page's raster. Only needed when the page's actual
         *content* changes (text edit, rotation, signature) - annotations
         live in their own vector layer and never need this."""
         if 0 <= n < len(self.page_items):
-            pix = self.doc.render_page(n, self.zoom)
-            qpix = pixmap_to_qpixmap(pix)
-            if self.invert_colors:
-                img = qpix.toImage()
-                img.invertPixels()
-                qpix = QPixmap.fromImage(img)
-            self.page_items[n].setPixmap(qpix)
-            self.page_items[n].rendered = True
+            item = self.page_items[n]
+            bz = self._base_zoom_for(n)
+            item.base = self._to_qpixmap(self.doc.render_page(n, bz))
+            item.base_zoom = bz
+            item.detail = None
+            item.detail_zoom = 0.0
+            item.update()
+            self._schedule_detail()
+
+    def _schedule_detail(self):
+        if not hasattr(self, "_detail_timer"):
+            self._detail_timer = QTimer(self)
+            self._detail_timer.setSingleShot(True)
+            self._detail_timer.timeout.connect(self._render_pending)
+        self._detail_timer.start(DETAIL_DELAY_MS)
+
+    def _render_pending(self):
+        """After a pause: re-render stale base images of visible pages, then
+        a sharp tile of the visible area when zoomed in past the base."""
+        visible = self.mapToScene(self.viewport().rect()).boundingRect()
+        far = visible.adjusted(0, -3 * visible.height(), 0, 3 * visible.height())
+        for item in self.page_items:
+            pr = item.page_rect()
+            if not pr.intersects(visible):
+                item.detail = None          # free memory of off-screen tiles
+                if not pr.intersects(far):
+                    item.base = None        # and of pages far away
+                continue
+            want = self._base_zoom_for(item.page_no)
+            # re-render only when more resolution is needed (zooming in) or
+            # the image is far too big for the new size (memory)
+            if item.base is None or want > item.base_zoom * 1.15 or want < item.base_zoom / 3:
+                item.base = self._to_qpixmap(self.doc.render_page(item.page_no, want))
+                item.base_zoom = want
+            if self.zoom <= item.base_zoom * 1.05:
+                if item.detail is not None:
+                    item.detail = None
+                    item.update()
+                continue
+            area = pr.intersected(visible.adjusted(-60, -60, 60, 60))
+            local = area.translated(-pr.topLeft())
+            if (item.detail is not None and item.detail_zoom == self.zoom
+                    and item.detail_rect.contains(local)):
+                continue
+            clip = pymupdf.Rect(local.left() / self.zoom, local.top() / self.zoom,
+                                local.right() / self.zoom, local.bottom() / self.zoom)
+            pix = self.doc.page(item.page_no).get_pixmap(
+                matrix=pymupdf.Matrix(self.zoom, self.zoom), clip=clip,
+                alpha=False, annots=False)
+            item.detail = self._to_qpixmap(pix)
+            item.detail_rect = QRectF(clip.x0 * self.zoom, clip.y0 * self.zoom,
+                                      pix.width, pix.height)
+            item.detail_zoom = self.zoom
+            item.update()
 
     def refresh_all(self):
         cur = self.current_page()
@@ -307,20 +436,20 @@ class PdfGraphicsView(QGraphicsView):
         super().resizeEvent(event)
         self._update_visible()
 
-    def _update_visible(self):
+    def _update_visible(self, render_now: bool = True):
         visible = self.mapToScene(self.viewport().rect()).boundingRect()
-        buffer = visible.height()
-        expanded = visible.adjusted(0, -buffer, 0, buffer)
-        for item in self.page_items:
-            r = QRectF(item.pos(), item.pixmap().size())
-            if not item.rendered and r.intersects(expanded):
-                self.refresh_page(item.page_no)
+        if render_now:
+            buffer = visible.height() * 0.5
+            expanded = visible.adjusted(0, -buffer, 0, buffer)
+            for item in self.page_items:
+                if not item.rendered and item.page_rect().intersects(expanded):
+                    self.refresh_page(item.page_no)
+        self._schedule_detail()
 
     # ------------------------------------------------------------------
     def _item_at_scene(self, scene_pos) -> PageItem | None:
         for item in self.page_items:
-            r = QRectF(item.pos(), item.pixmap().size())
-            if r.contains(scene_pos):
+            if item.page_rect().contains(scene_pos):
                 return item
         return None
 
@@ -360,7 +489,7 @@ class PdfGraphicsView(QGraphicsView):
         major = QPen(QColor(47, 111, 237, 110))
         major.setCosmetic(True)
         for item in self.page_items:
-            r = QRectF(item.pos(), item.pixmap().size())
+            r = item.page_rect()
             if not r.intersects(rect):
                 continue
             nx = int(r.width() / step) + 1
@@ -778,7 +907,7 @@ class PdfGraphicsView(QGraphicsView):
     # -- invert colours (dark plan reading) ----------------------------------
     def set_invert(self, enabled: bool):
         self.invert_colors = enabled
-        self.refresh_all()
+        self.refresh_all()          # never reuses images: all re-rendered
 
     # -- capture a zone to the clipboard -------------------------------------
     def capture_to_clipboard(self, item: PageItem, p1, p2, factor: float = 2.0) -> QImage:

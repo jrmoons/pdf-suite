@@ -176,7 +176,7 @@ check("capture in clipboard", not clip.isNull() and clip.width() == img.width(),
 win.act_invert.setChecked(True); win.toggle_invert(True)
 app.processEvents()
 view.refresh_page(0)
-c = view.page_items[0].pixmap().toImage().pixelColor(5, 5)
+c = view.page_items[0].base.toImage().pixelColor(5, 5)
 check("inverted page is dark", c.lightness() < 40, c.name())
 win.act_invert.setChecked(False); win.toggle_invert(False)
 
