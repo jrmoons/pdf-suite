@@ -283,8 +283,9 @@ def point_in_poly(x, y, poly) -> bool:
 
 # -- main entry -------------------------------------------------------------
 WALL_WORDS = ("mur", "wall", "cloison", "poteau", "column", "voile", "porteur", "maçonnerie")
-OPENING_WORDS = ("fenêtre", "fenetre", "porte", "door", "window", "menuiserie", "baie")
-_OPEN_RE = __import__("re").compile(r"fen[eê]tre|portes?|door|window|menuiserie|baie")
+OPENING_WORDS = ("fenêtre", "fenetre", "porte", "door", "window", "menuiserie", "baie",
+                 "châssis", "chassis", "coulissant", "vitrage", "glazing")
+_OPEN_RE = __import__("re").compile(r"fen[eê]tre|\bportes?\b|door|window|menuiserie|baie|ch[aâ]ssis|coulissant|vitrage|glazing")
 
 
 def _is_opening_layer(n: str) -> bool:
@@ -523,6 +524,39 @@ def _build(data: dict):
             v = grey_c[k] = _light_grey(c)
         return v
 
+    # furniture / fittings: small blocks filled light grey (wardrobe, WC frame,
+    # appliance), on any layer. Their outline and cross may be drawn apart on
+    # the wall layer: lines lying inside such a block are not walls.
+    fcell = scale
+    fgrid = {}
+    pad = 0.01 * scale
+    for path in data["drawings"]:
+        if "f" not in path["type"] or not _light_grey(path.get("fill")):
+            continue
+        ln_ = _norm(path.get("layer"))
+        if _is_wall_layer(ln_) or _is_opening_layer(ln_):
+            continue                 # grey walls stay walls
+        r = pymupdf.Rect(path["rect"])
+        if m is not None:
+            r = r * m
+        w_, h_ = r.width, r.height
+        if (min(w_, h_) < 0.08 * scale or min(w_, h_) > 1.3 * scale
+                or w_ * h_ > 6 * scale * scale):
+            continue
+        box = (r.x0 - pad, r.y0 - pad, r.x1 + pad, r.y1 + pad)
+        for gx in range(int(box[0] // fcell), int(box[2] // fcell) + 1):
+            for gy in range(int(box[1] // fcell), int(box[3] // fcell) + 1):
+                fgrid.setdefault((gx, gy), []).append(box)
+
+    def in_furniture(a, b):
+        if not fgrid:
+            return False
+        for bx in fgrid.get((int(a[0] // fcell), int(a[1] // fcell)), ()):
+            if (bx[0] <= a[0] <= bx[2] and bx[1] <= a[1] <= bx[3]
+                    and bx[0] <= b[0] <= bx[2] and bx[1] <= b[1] <= bx[3]):
+                return True
+        return False
+
     import time as _time
     tick = _time.time()
     # painted in drawing order, as on screen: the hatching of the walls is
@@ -574,6 +608,9 @@ def _build(data: dict):
             op = it[0]
             if op == "l":
                 a, b = T(it[1]), T(it[2])
+                if not filled and in_furniture(a, b):
+                    last = None
+                    continue                 # outline / cross of a fitting
                 if last != a:
                     qpath.moveTo(a[0], a[1])
                 qpath.lineTo(b[0], b[1])
@@ -596,6 +633,9 @@ def _build(data: dict):
                 else:
                     q = it[1]
                     c = [T(q[0]), T(q[1]), T(q[3]), T(q[2])]
+                if not filled and in_furniture(c[0], c[2]):
+                    last = None
+                    continue
                 qpath.addPolygon(QPolygonF([QPointF(x, y) for x, y in c]))
                 qpath.closeSubpath()
                 last = None
