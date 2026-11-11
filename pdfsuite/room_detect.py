@@ -282,10 +282,14 @@ def point_in_poly(x, y, poly) -> bool:
 
 
 # -- main entry -------------------------------------------------------------
-WALL_WORDS = ("mur", "wall", "cloison", "poteau", "column", "voile", "porteur", "maçonnerie")
+WALL_WORDS = ("mur", "wall", "cloison", "poteau", "column", "voile", "porteur", "maçonnerie",
+              "pilier", "béton", "beton",
+              "wand", "muur", "kolom", "metselwerk",        # néerlandais
+              "mauer", "stütze", "stutze",                   # allemand
+              "partition", "concrete")                       # anglais
 OPENING_WORDS = ("fenêtre", "fenetre", "porte", "door", "window", "menuiserie", "baie",
                  "châssis", "chassis", "coulissant", "vitrage", "glazing")
-_OPEN_RE = __import__("re").compile(r"fen[eê]tre|\bportes?\b|door|window|menuiserie|baie|ch[aâ]ssis|coulissant|vitrage|glazing")
+_OPEN_RE = __import__("re").compile(r"fen[eê]tre|\bportes?\b|door|window|menuiserie|baie|ch[aâ]ssis|coulissant|vitrage|glazing|\bramen\b|\braam|deur|kozijn|fenster|\bt[üu]r(en)?\b")
 
 
 def _is_opening_layer(n: str) -> bool:
@@ -317,8 +321,70 @@ def layer_roles(doc) -> dict:
     return roles
 
 
+_NOT_WALL_RE = __import__("re").compile(
+    r"text|tekst|benaming|annot|cot|maat|dimens|axe|assen|achse|grid|meubl|interi|furnit|mobil|"
+    r"sanit|electr|hatch|motif|patro|filling|rempliss|vloer|dalle|floor|cartouche|kader|titel|"
+    r"limite|parcel|surf|pixel|image|trap|escalier|stair|dak|couvert|toit|roof|ruimte|pi[eè]ce|"
+    r"room|raum|zone|niveau|hauteur|all[eè]ge|borstwer|macro|algemeen|g[eé]n[eé]ral|default|^0$|"
+    r"non d[eé]fini|undefined|annoter")
+
+
+def _wall_pen(drawings) -> float:
+    """PDF without layers: walls are drawn with the heaviest pen used in
+    quantity (dimensions, hatching and furniture use thinner ones). Returns
+    that pen width; strokes at least that thick are walls."""
+    import collections
+    length = collections.Counter()
+    for d in drawings:
+        if "s" not in d["type"] or not _neutral_dark(d.get("color"), 0.85):
+            continue
+        w = round(d.get("width") or 0, 2)
+        for it in d.get("items", ()):
+            if it[0] == "l":
+                length[w] += math.dist(it[1], it[2])
+            elif it[0] == "re":
+                r = it[1]
+                length[w] += 2 * (abs(r[2] - r[0]) + abs(r[3] - r[1]))
+    total = sum(length.values())
+    if not total or len(length) < 2:
+        return 0.0
+    for w in sorted(length, reverse=True):
+        if length[w] >= 0.10 * total:
+            return w - 0.005
+    return 0.0
+
+
+def wall_layer_names(doc, drawings=None) -> set:
+    """Names of the layers holding the walls. By their name in any of the
+    usual languages; otherwise (unknown names) the layer that holds most
+    of the drawing among those that are clearly not text, dimensions,
+    furniture... Cached on the document."""
+    cached = doc.__dict__.get("_wall_layers")
+    if cached is not None and drawings is None:
+        return cached
+    try:
+        names = {(v.get("name") or "") for v in doc.doc.get_ocgs().values()}
+    except Exception:
+        names = set()
+    named = {n for n in names if _is_wall_layer(_norm(n))}
+    if not named and names and drawings is not None:
+        import collections
+        count = collections.Counter(d.get("layer") or "" for d in drawings)
+        cands = [(c, n) for n, c in count.items()
+                 if n and not _NOT_WALL_RE.search(_norm(n)) and not _is_opening_layer(_norm(n))]
+        if cands:
+            named = {max(cands)[1]}
+    if not names and drawings is not None:
+        named = {""}                 # PDF without layers: the whole drawing
+    if drawings is not None or named:
+        doc.__dict__["_wall_layers"] = named
+    return named
+
+
 def has_wall_layers(doc) -> bool:
-    return "wall" in layer_roles(doc).values()
+    """Walls can be found: named wall layers, or layers whose content tells
+    which one holds the walls (decided when the page is read)."""
+    return True        # named layers, layers judged by content, or a flat PDF
 
 
 def _layer_items(doc, page_no, role_names):
@@ -432,7 +498,10 @@ def _collect(doc, page_no: int) -> dict:
         drawings = page.get_cdrawings()
     except Exception:
         drawings = []
+    walls = wall_layer_names(doc, drawings)
     return {"scale": doc.scale_points_per_meter,
+            "walls": walls,
+            "wall_pen": _wall_pen(drawings) if walls == {""} else 0.0,
             "m": ~page.derotation_matrix if page.rotation else None,
             "size": doc.visual_size(page_no), "drawings": drawings, "labels": labels}
 
@@ -493,6 +562,8 @@ def _build(data: dict):
 
     scale = data["scale"]
     m = data["m"]
+    wall_pen = data.get("wall_pen", 0.0)        # flat PDF: walls = heavy pen
+    min_fill = 0.12 * scale                      # flat PDF: letters are not walls
     T = _xf(m)
     w_pts, h_pts = data["size"]
     zoom = 1.0 / (PREP_PX_M * scale)
@@ -569,7 +640,8 @@ def _build(data: dict):
         kind = layer_kind.get(lname)
         if kind is None:
             n_ = _norm(lname)
-            kind = layer_kind[lname] = (_is_wall_layer(n_), _is_opening_layer(n_))
+            kind = layer_kind[lname] = ((lname in data["walls"] or _is_wall_layer(n_))
+                                        and not _is_opening_layer(n_), _is_opening_layer(n_))
         is_wall, is_open = kind
         if not (is_wall or is_open):
             continue
@@ -602,6 +674,20 @@ def _build(data: dict):
         # wall, even with a black outline: the room goes under it
         filled = "f" in ptype
         furn = filled and grey(path.get("fill"))
+        if wall_pen:
+            thin = stroked and (path.get("width") or 0) < wall_pen
+            if thin:
+                for it in items:                 # glazing / sills: window evidence
+                    if it[0] == "l":
+                        ev_lines.append(T(it[1]) + T(it[2]))
+                if not filled:
+                    continue
+            if filled:
+                rr = path["rect"]
+                if min(rr[2] - rr[0], rr[3] - rr[1]) < min_fill:
+                    continue                     # text glyphs, small symbols
+            if thin:
+                stroked = False
         qpath = QPainterPath()
         last = None
         for it in items:
@@ -649,7 +735,7 @@ def _build(data: dict):
             qp.fillPath(qpath, QBrush(QColor(g, g, g)))
         if stroked and not furn:
             col = path.get("color")
-            if dark(col):
+            if dark(col) or (wall_pen and _neutral_dark(col, 0.85)):   # grey walls (existing)
                 pen = QPen(QColor(0, 0, 0), 2.0)
             elif _gray(col).red() > 200:
                 pen = QPen(QColor(255, 255, 255), 1.0)  # white lines erase

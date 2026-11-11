@@ -135,11 +135,13 @@ win.open_file(os.path.join(OUT, "plan_A.pdf") if os.path.exists(os.path.join(OUT
 app.processEvents()
 t2 = win.current_tab()
 from pdfsuite import room_detect as rd
+# a PDF without layers is now analysed too (walls = heaviest pen): either a
+# room is found or a clear message is given, never a crash
 try:
-    rd.detect_room(t2.pdf_document, 0, (400, 300))
-    check("no layers -> explained refusal", t2.pdf_document is tab.pdf_document)
+    res = rd.detect_room(t2.pdf_document, 0, (400, 300))
+    check("flat PDF -> room found or explained", len(res["polygon"]) >= 3)
 except rd.RoomError as e:
-    check("no layers -> explained refusal", "calque" in str(e), str(e)[:60])
+    check("flat PDF -> room found or explained", len(str(e)) > 20, str(e)[:60])
 win.tabs.setCurrentIndex(0)
 
 # -- notes: the text is visible ------------------------------------------------------------
