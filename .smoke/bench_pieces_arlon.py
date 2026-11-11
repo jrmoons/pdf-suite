@@ -23,7 +23,7 @@ def rooms(doc):
             out.append((float(t.split()[0]), float(best[0].split()[0]), ((r.x0+r.x1)/2, (r.y0+r.y1)/2)))
     return out
 import pymupdf
-files = sys.argv[1:] or sorted(glob.glob(os.environ["TEMP"] + "/claude_arlon/10*.pdf"))
+files = sorted(glob.glob(os.environ["TEMP"] + "/claude_arlon/" + (sys.argv[1] if len(sys.argv) > 1 else "10*.pdf")))
 tot = ok = 0; ttot = 0; res = []
 for f in files:
     doc = PdfDocument(f); doc.set_ratio_scale(50)

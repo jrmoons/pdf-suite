@@ -870,7 +870,15 @@ def _bridges(segs: np.ndarray, scale: float, evidence=((), ())):
                                         out.append(tuple(qa) + tuple(qb))
                                         kinds.append(kind)
                 end = max(end, hi[j])
-    return np.array(out, float).reshape(-1, 4), np.array(fill, float).reshape(-1, 4), kinds
+    # the same opening is often found several times (overlapping lines)
+    uniq, ukinds, seen = [], [], set()
+    for b, k in zip(out, kinds):
+        key = tuple(round(v, 1) for v in b)
+        if key not in seen and key[2:] + key[:2] not in seen:
+            seen.add(key)
+            uniq.append(b)
+            ukinds.append(k)
+    return np.array(uniq, float).reshape(-1, 4), np.array(fill, float).reshape(-1, 4), ukinds
 
 
 _AREA_RE = __import__("re").compile(r"^\s*\d+[.,]\d+\s*m(²|2)\s*$")
@@ -893,6 +901,71 @@ def _room_labels(page, m, zoom):
     except Exception:
         pass
     return out
+
+
+CLOSET_MAX_M2 = 3.0        # small closed space behind a door, without room stamp
+PASSAGE_ZONE_M2 = 15.0     # unstamped zone behind an open passage (rest of a hall)
+
+
+def _add_closets(prep, reg, ox, oy, px_m, which="strong"):
+    """A wardrobe / niche behind doors belongs to the room: through each
+    door of the room, a small closed space without a room stamp of its own
+    is added. A WC or a storeroom has its own stamp and stays apart."""
+    B = prep.bridges
+    if not len(B):
+        return reg, ox, oy
+    z = prep.zoom
+    H, W = prep.mask.shape
+    h, w = reg.shape
+    near = dilate(reg, 4)
+    pieces = []
+    seen = set()
+    mask = prep.mask if which == "strong" else prep.mask_all
+    for (x0, y0, x1, y1), kind in zip(B, prep.kinds):
+        # behind a door: a closet; behind an open passage: an alcove / the
+        # rest of a hall. Never a space with its own room stamp.
+        if kind == "passage" and which != "all":
+            continue
+        max_px = (PASSAGE_ZONE_M2 if kind == "passage" else CLOSET_MAX_M2) / (px_m * px_m)
+        mx, my = (x0 + x1) / 2 * z, (y0 + y1) / 2 * z
+        iy, ix = int(my) - oy, int(mx) - ox
+        if not (0 <= iy < h and 0 <= ix < w and near[iy, ix]):
+            continue
+        L = math.hypot(x1 - x0, y1 - y0) or 1e-9
+        nx, ny = -(y1 - y0) / L, (x1 - x0) / L
+        for sgn in (1, -1):
+            sx = int(mx + sgn * nx * 5)
+            sy = int(my + sgn * ny * 5)
+            if not (0 <= sx < W and 0 <= sy < H) or mask[sy, sx]:
+                continue
+            ly, lx = sy - oy, sx - ox
+            if 0 <= ly < h and 0 <= lx < w and reg[ly, lx]:
+                continue                  # the room side
+            if (sy, sx) in seen:
+                continue
+            f = _flood_page(prep, (sy, sx), max_px, which)
+            if f is None or _count_labels(prep, *f) > 0:
+                continue
+            r2, x2, y2 = f
+            # a real closet is at least 40 cm deep; a door reveal (inside the
+            # thickness of the wall) is not
+            rr = max(1, int(round(0.2 / px_m)))
+            if not opening(np.pad(r2, rr + 1), rr).any():
+                continue
+            ys, xs = np.nonzero(r2)
+            seen.update(zip((ys + y2).tolist()[:1], (xs + x2).tolist()[:1]))
+            pieces.append(f)
+    if not pieces:
+        return reg, ox, oy
+    X0 = min([ox] + [p[1] for p in pieces])
+    Y0 = min([oy] + [p[2] for p in pieces])
+    X1 = max([ox + w] + [p[1] + p[0].shape[1] for p in pieces])
+    Y1 = max([oy + h] + [p[2] + p[0].shape[0] for p in pieces])
+    out = np.zeros((Y1 - Y0, X1 - X0), bool)
+    out[oy - Y0:oy - Y0 + h, ox - X0:ox - X0 + w] |= reg
+    for r2, x2, y2 in pieces:
+        out[y2 - Y0:y2 - Y0 + r2.shape[0], x2 - X0:x2 - X0 + r2.shape[1]] |= r2
+    return out, X0, Y0
 
 
 def _count_labels(prep, reg, ox, oy):
@@ -1257,18 +1330,20 @@ def detect_room(doc, page_no: int, click_xy: tuple[float, float]):
         k = np.argmin((ys + y0 - sy) ** 2 + (xs + x0 - sx) ** 2)
         sy, sx = int(ys[k] + y0), int(xs[k] + x0)
     max_px = MAX_ROOM_M2 / (px_m * px_m)
+    which = "strong"
     found = _flood_page(prep, (sy, sx), max_px)
     if (found is None or _count_labels(prep, *found) >= 2) and prep.mask_all is not prep.mask             and not prep.mask_all[sy, sx]:
         # several room stamps inside: open passages between rooms are closed too
         alt = _flood_page(prep, (sy, sx), max_px, "all")
         if alt is not None and (found is None or _count_labels(prep, *alt) < _count_labels(prep, *found)):
             found = alt
+            which = "all"
     if found is None:
         found = _flood_closed(prep, (sy, sx), px_m)
     if found is None:
         raise RoomError("Pièce non fermée ou trop grande : cliquez bien à l'intérieur "
                         "d'une pièce fermée par des murs.")
-    reg, ox, oy = found
+    reg, ox, oy = _add_closets(prep, *found, px_m, which)
     # padding so the morphology / outline never touch the border
     pad = 6
     region = np.zeros((reg.shape[0] + 2 * pad, reg.shape[1] + 2 * pad), bool)
