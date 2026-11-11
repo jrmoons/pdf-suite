@@ -1310,9 +1310,19 @@ def detect_room(doc, page_no: int, click_xy: tuple[float, float]):
     if not scale:
         raise RoomError("Indiquez d'abord l'échelle du plan.")
     if not has_wall_layers(doc):
-        raise RoomError("Ce plan n'a pas de calque de murs : la pièce automatique n'est pas "
-                        "possible. Utilisez Périmètre ou Surface (clic sur chaque coin), "
-                        "les cotes et ouvertures sont alors calculées automatiquement.")
+        try:
+            names = sorted({(v.get("name") or "").strip() for v in doc.doc.get_ocgs().values()} - {""})
+        except Exception:
+            names = []
+        if names:
+            shown = ", ".join(names[:25]) + (" …" if len(names) > 25 else "")
+            why = ("Aucun de ses calques ne s'appelle comme un mur (Mur, Cloison, Poteau, Voile…).\n"
+                   f"Calques trouvés : {shown}")
+        else:
+            why = "Ce PDF a été exporté sans calques : les murs ne se distinguent pas du reste du dessin."
+        raise RoomError("Pièce automatique impossible sur ce plan.\n\n" + why + "\n\n"
+                        "Utilisez Périmètre ou Surface (clic sur chaque coin) : les cotes et "
+                        "ouvertures sont alors calculées automatiquement.")
     prep = prepare(doc, page_no)
     z = prep.zoom
     px_m = 1.0 / (z * scale)
