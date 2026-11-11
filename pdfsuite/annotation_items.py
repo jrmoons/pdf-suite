@@ -700,9 +700,43 @@ class MeasurePolygonItem(MeasureItemBase):
     def is_area(self) -> bool:
         return self.subject.endswith("area")
 
+    label_offset = QPointF(0, 0)       # dragged by the user (visual page units)
+    _drag_label = None
+
     def _label_anchor(self) -> QPointF:
         n = len(self.points)
-        return QPointF(sum(p.x() for p in self.points) / n, sum(p.y() for p in self.points) / n)
+        c = QPointF(sum(p.x() for p in self.points) / n, sum(p.y() for p in self.points) / n)
+        return c + self.label_offset
+
+    # the label (P / S) can be dragged anywhere, the shape stays in place
+    def mousePressEvent(self, event):
+        if (event.button() == Qt.LeftButton and not self.locked
+                and self._label_rect().contains(event.pos())):
+            self._drag_label = (QPointF(event.pos()), QPointF(self.label_offset))
+            event.accept()
+            return
+        self._drag_label = None
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event):
+        if self._drag_label is not None:
+            start, off0 = self._drag_label
+            self.prepareGeometryChange()
+            self.label_offset = off0 + (QPointF(event.pos()) - start)
+            self.update()
+            event.accept()
+            return
+        super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event):
+        if self._drag_label is not None:
+            self._drag_label = None
+            o = self.label_offset
+            self.view.doc.set_label_offset(self.annot, o.x(), o.y())
+            self.view.documentModified.emit()
+            event.accept()
+            return
+        super().mouseReleaseEvent(event)
 
     def boundingRect(self) -> QRectF:
         if not self.points:
@@ -1262,6 +1296,8 @@ def build_item_for_annot(view, page, page_no: int, annot):
         item = MeasurePolygonItem(view, page_no, annot, points, color, label)
         item.subject = subject
         item.label = item._compute_label()
+        dx, dy = doc.get_label_offset(annot)
+        item.label_offset = QPointF(dx, dy)
         return [item]
 
     if kind == "FreeText" and subject in ("pdfsuite:stamp", "pdfsuite:callout"):

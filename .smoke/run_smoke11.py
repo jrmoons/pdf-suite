@@ -129,6 +129,36 @@ check("contour snapped on the wall corners", any(isinstance(o, ai.MeasurePolygon
       abs(doc.poly_area([(p.x(), p.y()) for p in o.points]) / S / S - 12) < 0.05
       for o in view.page_items[0].annot_items))
 
+# -- the P / S label of a room can be dragged, it stays where it was put ----------------
+polys = [o for o in view.page_items[0].annot_items if isinstance(o, ai.MeasurePolygonItem)]
+check("room outline present for the label test", bool(polys))
+if polys:
+    poly = polys[0]
+    win._activate_tool(Tool.SELECT)
+    c0 = poly._label_rect().center()
+    target = c0 + QPointF(0.5 * S, 0.8 * S)
+
+    def mouse(kind, scene_pt, buttons):
+        vp = view.mapFromScene(view.page_items[0].pos() + scene_pt)
+        ev = QMouseEvent(kind, QPointF(vp), QPointF(view.viewport().mapToGlobal(vp)),
+                         Qt.LeftButton, buttons, Qt.NoModifier)
+        app.sendEvent(view.viewport(), ev)
+        app.processEvents()
+
+    before_pts = [QPointF(p) for p in poly.points]
+    mouse(QEvent.MouseButtonPress, c0, Qt.LeftButton)
+    mouse(QEvent.MouseMove, (c0 + target) / 2, Qt.LeftButton)
+    mouse(QEvent.MouseMove, target, Qt.LeftButton)
+    mouse(QEvent.MouseButtonRelease, target, Qt.NoButton)
+    moved = poly._label_rect().center()
+    check("label follows the mouse", (moved - target).manhattanLength() < 2, (moved, target))
+    check("the room outline itself did not move",
+          all((a - b).manhattanLength() < 0.01 for a, b in zip(before_pts, poly.points)))
+    view.rebuild_annotations()
+    polys2 = [o for o in view.page_items[0].annot_items if isinstance(o, ai.MeasurePolygonItem)]
+    check("label position kept in the PDF", polys2 and
+          (polys2[0]._label_rect().center() - target).manhattanLength() < 2)
+
 # -- plan without layers: clear message, nothing created ----------------------------------
 win.open_file(os.path.join(OUT, "plan_A.pdf") if os.path.exists(os.path.join(OUT, "plan_A.pdf"))
               else plan)

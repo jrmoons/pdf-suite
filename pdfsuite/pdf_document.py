@@ -14,6 +14,7 @@ SCALE_KEY = "PDFSuiteScale"   # custom catalog key: plan scale (points per metre
 GEOM_KEY = "PDFSuiteGeom"     # custom annot key: our own exact geometry
 UNIT_KEY = "PDFSuiteUnit"     # custom catalog key: measurement unit (mm/cm/m)
 DECIMALS_KEY = "PDFSuiteDecimals"
+LABEL_KEY = "PDFSuiteLabelPos"   # custom annot key: offset of a measure's label
 
 # 1 metre of paper expressed in PDF points (72 pt per inch).
 POINTS_PER_PAPER_METER = 72 / 0.0254
@@ -835,8 +836,32 @@ class PdfDocument:
 
     def update_measure_polygon(self, index: int, old_annot, points, color, label: str,
                                subject: str = "pdfsuite:measure_perimeter"):
+        offset = self.get_label_offset(old_annot)
         self.delete_annot(index, old_annot)
-        return self.add_measure_polygon(index, points, color, label, subject)
+        annot = self.add_measure_polygon(index, points, color, label, subject)
+        if offset != (0.0, 0.0):
+            self._write_label_offset(annot, *offset)
+        return annot
+
+    # -- position of the label of a measure (dragged by the user) ---------
+    def get_label_offset(self, annot) -> tuple[float, float]:
+        try:
+            kind, val = self.doc.xref_get_key(annot.xref, LABEL_KEY)
+            if kind == "array":
+                v = [float(x) for x in val.strip("[]").split()]
+                if len(v) == 2:
+                    return v[0], v[1]
+        except Exception:
+            pass
+        return 0.0, 0.0
+
+    def _write_label_offset(self, annot, dx: float, dy: float):
+        self.doc.xref_set_key(annot.xref, LABEL_KEY, f"[{dx:.3f} {dy:.3f}]")
+
+    def set_label_offset(self, annot, dx: float, dy: float):
+        """The label was dragged: offset from the centre of the shape."""
+        self._write_label_offset(annot, dx, dy)
+        self.mark_dirty()
 
     # -- custom geometry (exact shape we drew, independent of the
     # -- annotation rectangle that the PDF library may enlarge) ----------
@@ -1120,6 +1145,7 @@ _OPS = {
     "update_line": ("Déplacement", "annot"),
     "update_ink": ("Déplacement", "annot"),
     "add_measure_line": ("Mesure", "annot"),
+    "set_label_offset": ("Déplacer l'étiquette", "annot"),
     "update_measure_line": ("Mesure modifiée", "annot"),
     "add_dimension": ("Cote", "annot"),
     "update_dimension": ("Cote modifiée", "annot"),

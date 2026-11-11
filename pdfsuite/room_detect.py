@@ -788,6 +788,18 @@ def _build(data: dict):
     prep.kinds = kinds
     prep.lines = np.vstack([segs, closers])
     prep.arcs = arcs
+    prep.flat = bool(wall_pen)
+    # content of the drawing that is not a wall (thin lines): used to tell an
+    # empty box (WC frame, duct casing) from a hatched wall in a flat PDF
+    prep.content = None
+    if wall_pen and ev_lines:
+        cm = np.zeros((H, W), bool)
+        E = np.array(ev_lines, float).reshape(-1, 4) * zoom
+        for t in (0.0, 0.25, 0.5, 0.75, 1.0):
+            xs = np.clip((E[:, 0] + (E[:, 2] - E[:, 0]) * t).astype(int), 0, W - 1)
+            ys = np.clip((E[:, 1] + (E[:, 3] - E[:, 1]) * t).astype(int), 0, H - 1)
+            cm[ys, xs] = True
+        prep.content = cm
     prep.ev_arcs = ev_arcs
     prep.scale = scale
     prep.runs = {}
@@ -1052,6 +1064,52 @@ def _add_closets(prep, reg, ox, oy, px_m, which="strong"):
     for r2, x2, y2 in pieces:
         out[y2 - Y0:y2 - Y0 + r2.shape[0], x2 - X0:x2 - X0 + r2.shape[1]] |= r2
     return out, X0, Y0
+
+
+BOX_MAX_M2, BOX_MAX_DEPTH_M = 1.0, 0.36
+
+
+def _add_empty_boxes(prep, reg, ox, oy, px_m):
+    """Flat PDF: a narrow closed box drawn with the wall pen but EMPTY inside
+    (WC frame, duct casing, built-in unit) is not a wall: a real wall is
+    hatched. Such a box stuck to the room is added to it, the room goes to
+    the wall behind."""
+    if not getattr(prep, "flat", False) or prep.content is None:
+        return reg, ox, oy
+    H, W = prep.mask.shape
+    m = max(4, int(0.5 / px_m))
+    X0, Y0 = max(0, ox - m), max(0, oy - m)
+    X1, Y1 = min(W, ox + reg.shape[1] + m), min(H, oy + reg.shape[0] + m)
+    win_reg = np.zeros((Y1 - Y0, X1 - X0), bool)
+    win_reg[oy - Y0:oy - Y0 + reg.shape[0], ox - X0:ox - X0 + reg.shape[1]] = reg
+    free = ~prep.mask[Y0:Y1, X0:X1] & ~win_reg
+    ring = dilate(win_reg, 4) & free
+    max_px = BOX_MAX_M2 / (px_m * px_m)
+    rr = max(1, int(round(BOX_MAX_DEPTH_M / 2 / px_m)))
+    content = prep.content[Y0:Y1, X0:X1]
+    added = np.zeros_like(win_reg)
+    todo = ring.copy()
+    for _ in range(600):
+        ys, xs = np.nonzero(todo)
+        if not len(ys):
+            break
+        comp = flood(free, (int(ys[0]), int(xs[0])), stop_at_border=True)
+        if comp is None:
+            # open to the outside of the window: not a box
+            todo &= ~flood(free, (int(ys[0]), int(xs[0])))
+            continue
+        todo &= ~comp
+        n = int(comp.sum())
+        if n > max_px or n < 4:
+            continue
+        if opening(np.pad(comp, rr + 1), rr).any():
+            continue                      # deeper than a frame / casing
+        if (content & comp).any():
+            continue                      # hatched: a real wall
+        added |= dilate(comp, 2)          # the box and its outline
+    if not added.any():
+        return reg, ox, oy
+    return win_reg | added, X0, Y0
 
 
 def _count_labels(prep, reg, ox, oy):
@@ -1329,6 +1387,34 @@ def _regularize(poly, scale, lines=np.zeros((0, 4)), tol=1.0):
     return drop_collinear(pts, tol=0.05)
 
 
+def _straighten(poly, tol_deg=2.5):
+    """Edges within a few degrees of horizontal / vertical are made exact
+    and the corners recomputed (a wall drawn at 1-2° is a drawing
+    inaccuracy; real slanted walls are far steeper)."""
+    n = len(poly)
+    if n < 4:
+        return poly
+    lines = []
+    for i in range(n):
+        (x0, y0), (x1, y1) = poly[i], poly[(i + 1) % n]
+        ang = math.degrees(math.atan2(y1 - y0, x1 - x0)) % 180
+        mx, my = (x0 + x1) / 2, (y0 + y1) / 2
+        if 0 < min(ang, 180 - ang) < tol_deg:
+            lines.append(((x0, my), (x1, my)))
+        elif 0 < abs(ang - 90) < tol_deg:
+            lines.append(((mx, y0), (mx, y1)))
+        else:
+            lines.append(((x0, y0), (x1, y1)))
+    out = []
+    for i in range(n):
+        q = _intersect(lines[i - 1], lines[i])
+        if q is None or math.dist(q, poly[i]) > 0.5 * max(1e-9, min(
+                math.dist(*lines[i - 1]), math.dist(*lines[i]))):
+            q = poly[i]
+        out.append(q)
+    return drop_collinear(out, tol=0.05)
+
+
 def _remove_frames(poly, marks, scale):
     """Door frames / casings jut a few centimetres into the room next to
     the openings; plans measure the room without them. Steps and bumps of
@@ -1440,6 +1526,7 @@ def detect_room(doc, page_no: int, click_xy: tuple[float, float]):
         raise RoomError("Pièce non fermée ou trop grande : cliquez bien à l'intérieur "
                         "d'une pièce fermée par des murs.")
     reg, ox, oy = _add_closets(prep, *found, px_m, which)
+    reg, ox, oy = _add_empty_boxes(prep, reg, ox, oy, px_m)
     # padding so the morphology / outline never touch the border
     pad = 6
     region = np.zeros((reg.shape[0] + 2 * pad, reg.shape[1] + 2 * pad), bool)
@@ -1489,6 +1576,7 @@ def detect_room(doc, page_no: int, click_xy: tuple[float, float]):
     marks = [m for m in marks if cx0 < m[0] < cx1 and cy0 < m[1] < cy1]
     poly = _remove_frames(poly, marks, scale)
     poly = _regularize(poly, scale, lines, tol)
+    poly = _straighten(poly)
     if len(poly) < 3:
         raise RoomError("Contour de pièce introuvable.")
     openings = _bridge_openings(prep, poly, scale)
