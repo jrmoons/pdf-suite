@@ -1651,7 +1651,7 @@ def _room_methods():
             extra.append(f"{doors} porte" + ("s" if doors > 1 else ""))
         if wins:
             extra.append(f"{wins} fenêtre" + ("s" if wins > 1 else ""))
-        self.statusMessage.emit(f"Pièce : {label}" + (" · " + ", ".join(extra) if extra else ""))
+        self.statusMessage.emit("Pièce : " + label.replace("\n", " · ") + (" · " + ", ".join(extra) if extra else ""))
 
     def _add_room_cotes(self, page_no, poly, openings):
         """Cotes inside the room along each side: the side's length, or a

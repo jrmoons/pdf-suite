@@ -426,7 +426,7 @@ def prepare(doc, page_no: int):
     qp.setRenderHint(QPainter.Antialiasing, False)
     qp.scale(zoom, zoom)
     P = lambda p: QPointF(*T(p))
-    segs, arcs, ev_lines, ev_arcs = [], [], [], []
+    segs, arcs, ev_lines, ev_arcs, ev_circ = [], [], [], [], []
     min_len = 0.015 * scale
     # painted in drawing order, as on screen: the hatching of the walls is
     # long lines hidden afterwards by white fills, they must stay hidden
@@ -442,6 +442,14 @@ def prepare(doc, page_no: int):
                 a, b = T(it[1]), T(it[4])
                 arcs.append(((a[0] + b[0]) / 2, (a[1] + b[1]) / 2, math.dist(a, b)))
                 ev_arcs.append((a, b))
+                c1, c2 = T(it[2]), T(it[3])
+                # centre = crossing of the normals at both ends (circular arc)
+                q = _intersect((a, (a[0] - (c1[1] - a[1]), a[1] + (c1[0] - a[0]))),
+                               (b, (b[0] - (b[1] - c2[1]), b[1] + (b[0] - c2[0]))))
+                if q is not None:
+                    r = (math.dist(q, a) + math.dist(q, b)) / 2
+                    if abs(math.dist(q, a) - math.dist(q, b)) < 0.1 * r:
+                        ev_circ.append((q[0], q[1], r))
             elif is_open and it[0] == "l":
                 ev_lines.append(T(it[1]) + T(it[2]))
             elif is_open and it[0] == "re":
@@ -506,7 +514,7 @@ def prepare(doc, page_no: int):
     mask = arr < 128
     segs = np.array(segs, float).reshape(-1, 4)
     segs = _visible(segs, mask, zoom)
-    bridges, fillers, kinds = _bridges(segs, scale, (ev_lines, ev_arcs))
+    bridges, fillers, kinds = _bridges(segs, scale, (ev_lines, ev_circ))
     closers = np.vstack([bridges, fillers])
 
     def lines_mask(lines):
@@ -594,9 +602,8 @@ def _bridges(segs: np.ndarray, scale: float, evidence=((), ())):
     EL = np.array(ev_lines, float).reshape(-1, 4)
     need_evidence = bool(len(EL) or ev_arcs)
     near_end = 0.2 * scale
-    # arcs: a, b, radius (chord of a quarter circle / sqrt 2)
-    AR = np.array([(a[0], a[1], b[0], b[1], math.dist(a, b) / math.sqrt(2)) for a, b in ev_arcs],
-                  float).reshape(-1, 5)
+    # door swings: centre (hinge) and radius (leaf)
+    AR = np.array(ev_arcs, float).reshape(-1, 3)
 
     def has_evidence(pa, pb):
         L = math.dist(pa, pb)
@@ -615,14 +622,15 @@ def _bridges(segs: np.ndarray, scale: float, evidence=((), ())):
             if ok.any():
                 return "fenêtre"
         if len(AR):
-            ok = (AR[:, 4] >= 0.4 * L) & (AR[:, 4] <= 1.25 * L)
+            # hinge at one end of the gap, leaf = the gap (single) or half (double)
+            ok = (AR[:, 2] >= 0.4 * L) & (AR[:, 2] <= 1.2 * L)
             if ok.any():
                 A = AR[ok]
-                d = np.minimum.reduce([np.hypot(A[:, 0] - p[0], A[:, 1] - p[1])
-                                       for p in (pa, pb)] +
-                                      [np.hypot(A[:, 2] - p[0], A[:, 3] - p[1]) for p in (pa, pb)])
+                d = np.minimum(np.hypot(A[:, 0] - pa[0], A[:, 1] - pa[1]),
+                               np.hypot(A[:, 0] - pb[0], A[:, 1] - pb[1]))
                 if (d <= near_end).any():
                     return "porte"
+
         return None
 
     def has_jamb(px, py, dx, dy):
@@ -661,9 +669,20 @@ def _bridges(segs: np.ndarray, scale: float, evidence=((), ())):
             # short gaps; their gaps are filled, but they are no wall face
             short = (hi[ln] - lo[ln]) < dash_len
             dash = np.zeros(len(ln), bool)
-            for k in range(len(ln) - 1):
-                if short[k] and short[k + 1] and 0 <= lo[ln[k + 1]] - hi[ln[k]] < dash_gap:
-                    dash[k] = dash[k + 1] = True
+            # a real dashed line: at least 3 short pieces with real gaps
+            link = [short[k] and short[k + 1] and 0.002 * scale < lo[ln[k + 1]] - hi[ln[k]] < dash_gap
+                    for k in range(len(ln) - 1)]
+            k = 0
+            while k < len(link):
+                if link[k]:
+                    j = k
+                    while j < len(link) and link[j]:
+                        j += 1
+                    if j - k >= 2:                 # k .. j : j - k + 1 pieces
+                        dash[k:j + 1] = True
+                    k = j
+                else:
+                    k += 1
             end = hi[ln[0]]
             for j in ln[1:]:
                 gap = lo[j] - end
@@ -825,6 +844,12 @@ def _snap_edges(poly, lines, tol, scale):
         ov = np.minimum(np.maximum(t0, t1), L) - np.maximum(np.minimum(t0, t1), 0)
         ok = (cross < 0.035) & (d0 < tol) & (d1 < tol) & (ov > np.minimum(0.3 * L, 0.5 * lL))
         if not ok.any():
+            # no drawing line: an edge almost horizontal / vertical is made exact
+            ang = math.degrees(math.atan2(uy, ux)) % 180
+            if min(ang, 180 - ang) < 6:
+                ux, uy = (1.0 if ux >= 0 else -1.0), 0.0
+            elif abs(ang - 90) < 6:
+                ux, uy = 0.0, (1.0 if uy >= 0 else -1.0)
             eqs.append(((a[0] + b[0]) / 2, (a[1] + b[1]) / 2, ux, uy, False))
             continue
         idx = np.nonzero(ok)[0]
@@ -853,7 +878,7 @@ def _snap_edges(poly, lines, tol, scale):
                 q = (e2[0] + t * e2[2], e2[1] + t * e2[3])
             else:
                 q = p
-        elif math.dist(q, p) > 3 * tol:
+        elif math.dist(q, p) > 6 * tol:
             q = p
         out.append(q)
     return out

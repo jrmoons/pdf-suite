@@ -510,7 +510,10 @@ class PdfDocument:
         area = self.fmt_area_pts2(self.poly_area(pts))
         if subject.endswith("area"):
             return f"S = {area}"
-        return f"P = {self.fmt_length_pts(self.poly_perimeter(pts))} · S = {area}"
+        # périmètre toujours en mètres (convention des plans), surface à la ligne
+        per = self.points_to_meters(self.poly_perimeter(pts))
+        per = "?" if per is None else f"{per:.2f}".replace(".", ",") + " m"
+        return f"P = {per}\nS = {area}"
 
     def relabel_measurements(self):
         """Rewrites the stored label of every measurement (after a change
@@ -947,7 +950,7 @@ class PdfDocument:
                              "area": "Surface"}.get(kind, kind),
                     "length": length / scale / u if scale else None,
                     "area": area / (scale * scale) if (scale and area is not None) else None,
-                    "label": self.measure_label(subject, pts),
+                    "label": self.measure_label(subject, pts).replace("\n", " · "),
                 })
         return rows
 

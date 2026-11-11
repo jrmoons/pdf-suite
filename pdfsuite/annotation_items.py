@@ -57,6 +57,9 @@ def _build_menu(view, locked: bool, on_toggle_lock=None, on_delete=None) -> QMen
     return menu
 
 
+
+LABEL_MIN_ZOOM = 3.5   # below this zoom, cotes / measure texts scale with the plan
+
 class VertexHandle(QGraphicsEllipseItem):
     """A small draggable dot at one vertex of a measurement shape.
 
@@ -376,7 +379,9 @@ class NoteItem(QGraphicsObject):
         self.setToolTip(content)
 
     def _k(self) -> float:
-        return 1.0 / max(self.view.zoom, 1e-6)
+        # constant size on screen when zoomed in; zoomed far out, the texts
+        # shrink with the plan instead of covering it
+        return 1.0 / max(self.view.zoom, LABEL_MIN_ZOOM)
 
     def _font(self) -> QFont:
         f = QFont("Arial")
@@ -533,7 +538,9 @@ class MeasureItemBase(QGraphicsObject):
 
     # -- label geometry (in scene units, depends on the view zoom) ---------
     def _k(self) -> float:
-        return 1.0 / max(self.view.zoom, 1e-6)
+        # constant size on screen when zoomed in; zoomed far out, the texts
+        # shrink with the plan instead of covering it
+        return 1.0 / max(self.view.zoom, LABEL_MIN_ZOOM)
 
     def _font(self) -> QFont:
         f = QFont("Arial")
@@ -547,8 +554,9 @@ class MeasureItemBase(QGraphicsObject):
     def _label_rect(self) -> QRectF:
         fm = QFontMetricsF(self._font())
         k = self._k()
-        w = (fm.horizontalAdvance(self.label) + 10) * k
-        h = (fm.height() + 4) * k
+        lines = self.label.split("\n")
+        w = (max(fm.horizontalAdvance(t) for t in lines) + 10) * k
+        h = (fm.height() * len(lines) + 4) * k
         c = self._label_anchor()
         return QRectF(c.x() - w / 2, c.y() - h / 2, w, h)
 
@@ -761,7 +769,9 @@ class DimensionItem(QGraphicsObject):
 
     # -- geometry ---------------------------------------------------------
     def _k(self) -> float:
-        return 1.0 / max(self.view.zoom, 1e-6)
+        # constant size on screen when zoomed in; zoomed far out, the texts
+        # shrink with the plan instead of covering it
+        return 1.0 / max(self.view.zoom, LABEL_MIN_ZOOM)
 
     def normal(self) -> QPointF:
         dx, dy = self.b.x() - self.a.x(), self.b.y() - self.a.y()

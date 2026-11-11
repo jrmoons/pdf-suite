@@ -181,7 +181,10 @@ check("page size in status bar", win.size_label.text().startswith("L :"), win.si
 send((200, 200), QEvent.MouseMove)
 check("cursor X/Y in status bar", win.cursor_label.text().startswith("X :"), win.cursor_label.text())
 
-# constant on-screen label size: bounding of label shrinks in scene units when zooming in
+# constant on-screen label size (zoomed in, above LABEL_MIN_ZOOM): bounding of label
+# shrinks in scene units when zooming in; zoomed far out it scales with the plan
+view.set_zoom(ai.LABEL_MIN_ZOOM)
+lines = [o for o in view.page_items[0].annot_items if isinstance(o, ai.MeasureLineItem)]
 lab0 = lines[0]._label_rect().height() if lines else 0
 view.set_zoom(view.zoom * 4)
 lines = [o for o in view.page_items[0].annot_items if isinstance(o, ai.MeasureLineItem)]
