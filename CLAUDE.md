@@ -51,6 +51,12 @@
   proche » essayé = Arlon 2 baisse) ; `_remove_frames`, `_regularize` (chanfreins non dessinés,
   micro-décrochements) ; blocs gris CLAIR (0,7-0,95) des calques non-mur = mobilier (gris moyen =
   murs béton, cf. test 11).
+  Métré aux ouvertures (2026-11-12, `_extend_openings`, test `.smoke/run_smoke13.py`) : porte
+  ouverte vers la pièce voisine → le seuil (jusqu'à l'autre face du mur) est compté ; porte
+  ouverte vers la pièce → droit au mur ; texte d'allège (« all. 0.00 », `_SILL_RE`) ≤ 2 cm →
+  embrasure jusqu'au châssis (trait du calque fenêtre, morceaux additionnés), allège > 0 → droit.
+  `detect_room` renvoie aussi `polygon_nu` (au nu des murs) : le banc compare CE polygone aux
+  étiquettes m² du plan.
   Reste à faire : halls en L / circulations (Hall RDJ Arlon 1 9,32 → 2,6 m²), WC bâti-support,
   porte de douche en verre en biais, terrasse/châssis coulissant à vérifier, murs hors calque
   « Mur ». Piège : mes scripts heredoc ont cassé des `\b` / `\n` → relire après chaque patch.

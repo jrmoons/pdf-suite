@@ -53,12 +53,14 @@ for f in files:
         dt = time.time() - t; ttot += dt; tot += 1
         s = doc.scale_points_per_meter
         if r:
-            A = doc.poly_area(r["polygon"]) / s / s; P = doc.poly_perimeter(r["polygon"]) / s
+            core = r.get("polygon_nu", r["polygon"])   # plan stamps: room at the wall faces
+            A = doc.poly_area(core) / s / s; P = doc.poly_perimeter(core) / s
+            AX = doc.poly_area(r["polygon"]) / s / s
             good = abs(A - area) <= max(0.05, 0.01 * area)
             ok += good
-            res.append((os.path.basename(f), round(x), round(y), area, round(A, 2), per, round(P, 2), round(dt, 2), "OK" if good else "BAD", len(r["openings"])))
+            res.append((os.path.basename(f), round(x), round(y), area, round(A, 2), per, round(P, 2), round(dt, 2), "OK" if good else "BAD", len(r["openings"]), round(AX - A, 2)))
         else:
-            res.append((os.path.basename(f), round(x), round(y), area, None, per, None, round(dt, 2), err, 0))
+            res.append((os.path.basename(f), round(x), round(y), area, None, per, None, round(dt, 2), err, 0, 0))
     print(f, "prep", round(tprep, 2), file=sys.stderr)
 for r in res: print(*r, sep="\t")
 print(f"OK {ok}/{tot}  temps moyen {ttot/max(1,tot):.2f}s  max {max(r[7] for r in res):.2f}s")

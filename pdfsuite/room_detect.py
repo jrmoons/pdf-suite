@@ -484,7 +484,7 @@ def _collect(doc, page_no: int) -> dict:
     """Everything read from MuPDF (main thread only): drawings, room
     stamps, page geometry. The heavy analysis then runs in _build."""
     page = doc.page(page_no)
-    labels = []
+    labels, sills = [], []
     try:
         for b in page.get_text("dict")["blocks"]:
             for ln in b.get("lines", ()):
@@ -492,6 +492,11 @@ def _collect(doc, page_no: int) -> dict:
                 if _AREA_RE.match(t):
                     r = pymupdf.Rect(ln["bbox"])
                     labels.append(((r.x0 + r.x1) / 2, (r.y0 + r.y1) / 2))
+                ms = _SILL_RE.match(t)
+                if ms:
+                    r = pymupdf.Rect(ln["bbox"])
+                    v = float((ms.group(1) + ms.group(2)).replace(" ", "").replace(",", "."))
+                    sills.append(((r.x0 + r.x1) / 2, (r.y0 + r.y1) / 2, v))
     except Exception:
         pass
     try:
@@ -503,7 +508,8 @@ def _collect(doc, page_no: int) -> dict:
             "walls": walls,
             "wall_pen": _wall_pen(drawings) if walls == {""} else 0.0,
             "m": ~page.derotation_matrix if page.rotation else None,
-            "size": doc.visual_size(page_no), "drawings": drawings, "labels": labels}
+            "size": doc.visual_size(page_no), "drawings": drawings, "labels": labels,
+            "sills": sills}
 
 
 def _key(doc, page_no):
@@ -577,6 +583,7 @@ def _build(data: dict):
     if m is None:
         T = lambda p: (p[0], p[1])
     segs, arcs, ev_lines, ev_arcs, ev_circ = [], [], [], [], []
+    swings = []                      # door swings: hinge, radius, both ends
     min_len = 0.015 * scale
     layer_kind = {}                  # layer name -> (is_wall, is_open), computed once
     dark_c, grey_c = {}, {}          # colour -> bool, computed once
@@ -665,6 +672,7 @@ def _build(data: dict):
                     r = (math.dist(q, a) + math.dist(q, b)) / 2
                     if abs(math.dist(q, a) - math.dist(q, b)) < 0.1 * r:
                         ev_circ.append((q[0], q[1], r))
+                        swings.append((q[0], q[1], r) + tuple(a) + tuple(b))
             elif is_open and op == "l":
                 ev_lines.append(T(it[1]) + T(it[2]))
             elif is_open and op == "re":
@@ -822,6 +830,15 @@ def _build(data: dict):
             cm[ys, xs] = True
         prep.content = cm
     prep.ev_arcs = ev_arcs
+    prep.ev_circ = ev_circ
+    prep.swings = np.array(swings, float).reshape(-1, 7)
+    prep.ev_lines = np.array(ev_lines, float).reshape(-1, 4)
+    sills = []
+    for x, y, v in data.get("sills", ()):
+        if m is not None:
+            x, y = tuple(pymupdf.Point(x, y) * m)
+        sills.append((x, y, v))
+    prep.sills = sills
     prep.scale = scale
     prep.runs = {}
     _runs(prep)                        # flood tables ready before the first click
@@ -1191,6 +1208,10 @@ def _bridges(segs: np.ndarray, scale: float, evidence=((), ())):
 
 
 _AREA_RE = __import__("re").compile(r"^\s*\d+[.,]\d+\s*m(²|2)\s*$")
+# window sill height written on the plan ("all. 0.27", "allège 0.00", "BRH 0,90",
+# "Br. 0.00", "borstwering 0.85"): at 0 the floor goes into the window recess
+_SILL_RE = __import__("re").compile(
+    r"(?i)^\s*(?:all(?:[eè]ge)?|brh|br(?:[üu]stung)?|bw|borstwering|sill)\.?\s*[:=]?\s*([-+]?)\s*(\d+(?:[.,]\d+)?)\s*m?\s*$")
 
 
 def _room_labels(page, m, zoom):
@@ -1685,7 +1706,7 @@ def _remove_frames(poly, marks, scale):
     return drop_collinear(pts, tol=0.05)
 
 
-def detect_room(doc, page_no: int, click_xy: tuple[float, float]):
+def detect_room(doc, page_no: int, click_xy: tuple[float, float], extend: bool = True):
     """``click_xy`` in visual page points. Needs a plan exported with its
     layers (walls on a "Mur"-like layer). Returns {"polygon": [(x, y)],
     "openings": [{"edge", "a", "b", "kind"}]} in visual page points."""
@@ -1791,7 +1812,10 @@ def detect_room(doc, page_no: int, click_xy: tuple[float, float]):
     if len(poly) < 3:
         raise RoomError("Contour de pièce introuvable.")
     openings = _bridge_openings(prep, poly, scale)
-    return {"polygon": poly, "openings": openings}
+    core = poly
+    if extend:
+        poly, openings = _extend_openings(prep, poly, openings, scale)
+    return {"polygon": poly, "openings": openings, "polygon_nu": core}
 
 
 def _bridge_openings(prep, pts, scale):
@@ -1826,6 +1850,173 @@ def _bridge_openings(prep, pts, scale):
             pb = (a[0] + ux * e, a[1] + uy * e)
             out.append({"edge": i, "a": pa, "b": pb, "kind": kind})
     return out
+
+
+SILL_ZERO_M = 0.02          # sill at most this high = floor-level window
+SILL_NEAR_M = 1.6           # sill text -> its window: at most this far
+RECESS_MAX_M = 0.7          # wall thickness: a threshold / recess is at most this deep
+
+
+def _extend_openings(prep, poly, openings, scale):
+    """Measuring practice at the openings (the room outline stays on the wall
+    face elsewhere):
+    - door opening into the NEIGHBOUR room: the threshold (door width x wall
+      thickness, up to the far face of the wall) belongs to this room; a door
+      opening into this room: straight along the wall;
+    - window with its sill at 0 ("all. 0.00", French window, sliding door):
+      the recess up to the frame belongs to the room (perimeter and area); a
+      window with a sill higher than 0: straight along the wall."""
+    n = len(poly)
+    if n < 3 or not openings:
+        return poly, openings
+    B = prep.bridges
+    S = getattr(prep, "swings", np.zeros((0, 7)))
+    EL = getattr(prep, "ev_lines", np.zeros((0, 4)))
+    sills = getattr(prep, "sills", [])
+    bmid = (B[:, :2] + B[:, 2:]) / 2 if len(B) else np.zeros((0, 2))
+    dmax = RECESS_MAX_M * scale
+
+    def outward(i):
+        a, b = poly[i], poly[(i + 1) % n]
+        L = math.dist(a, b) or 1e-9
+        ux, uy = (b[0] - a[0]) / L, (b[1] - a[1]) / L
+        nx, ny = uy, -ux
+        mx, my = (a[0] + b[0]) / 2, (a[1] + b[1]) / 2
+        e = 0.01 * scale
+        if point_in_poly(mx + nx * e, my + ny * e, poly):
+            nx, ny = -nx, -ny
+        return ux, uy, nx, ny
+
+    def lines_beyond(lines, pa, pb, ux, uy, nx, ny, d_lo, d_hi, min_cover):
+        """Outward offsets of the lines parallel to pa-pb, covering at least
+        min_cover of it, between d_lo and d_hi."""
+        if not len(lines):
+            return np.zeros(0)
+        W = math.dist(pa, pb)
+        x0, y0, x1, y1 = lines.T
+        vx, vy = x1 - x0, y1 - y0
+        vl = np.hypot(vx, vy) + 1e-9
+        par = np.abs(vx * uy - vy * ux) / vl < 0.05
+        o0 = (x0 - pa[0]) * nx + (y0 - pa[1]) * ny
+        o1 = (x1 - pa[0]) * nx + (y1 - pa[1]) * ny
+        t0 = (x0 - pa[0]) * ux + (y0 - pa[1]) * uy
+        t1 = (x1 - pa[0]) * ux + (y1 - pa[1]) * uy
+        lo_ = np.clip(np.minimum(t0, t1), 0, W)
+        hi_ = np.clip(np.maximum(t0, t1), 0, W)
+        off = (o0 + o1) / 2
+        ok = (par & (np.abs(o0 - o1) < 0.01 * scale) & (hi_ - lo_ > 0)
+              & (off > d_lo) & (off < d_hi))
+        if not ok.any():
+            return np.zeros(0)
+        # a frame is often drawn in pieces: covered length = union of the
+        # pieces lying on the same line
+        idx = np.nonzero(ok)[0]
+        idx = idx[np.argsort(off[idx])]
+        res, grp = [], [idx[0]]
+        for k in list(idx[1:]) + [None]:
+            if k is not None and off[k] - off[grp[-1]] < 0.005 * scale:
+                grp.append(k)
+                continue
+            spans = sorted((lo_[j], hi_[j]) for j in grp)
+            tot, end = 0.0, -1.0
+            for s0, s1 in spans:
+                if s1 > end:
+                    tot += s1 - max(s0, end)
+                    end = s1
+            if tot >= min_cover * W:
+                res.append(float(np.mean(off[grp])))
+            if k is not None:
+                grp = [k]
+        return np.array(res)
+
+    notches = []
+    for o in openings:
+        i, pa, pb = o["edge"], o["a"], o["b"]
+        W = math.dist(pa, pb)
+        if W < 1e-6:
+            continue
+        ux, uy, nx, ny = outward(i)
+        mid = ((pa[0] + pb[0]) / 2, (pa[1] + pb[1]) / 2)
+        # far face of the wall: the bridge on the other face
+        far = lines_beyond(B, pa, pb, ux, uy, nx, ny, 0.04 * scale, dmax, 0.7)
+        # sill height written next to this opening: the text belongs to the
+        # opening of the page nearest to it
+        sill = None
+        for x, y, v in sills:
+            d_text = math.dist((x, y), mid)
+            if d_text > SILL_NEAR_M * scale:
+                continue
+            if len(bmid):
+                d_b = np.hypot(bmid[:, 0] - x, bmid[:, 1] - y)
+                k = int(np.argmin(d_b))
+                if math.dist(tuple(bmid[k]), mid) > dmax + 0.1 * scale:
+                    continue             # nearer to another opening
+            if sill is None or d_text < sill[1]:
+                sill = (v, d_text)
+        depth = 0.0
+        if sill is not None:
+            if sill[0] <= SILL_ZERO_M:
+                # up to the frame: nearest window line inside the wall
+                lim = float(far.max()) if len(far) else dmax
+                fr = lines_beyond(EL, pa, pb, ux, uy, nx, ny, 0.02 * scale, lim + 0.005 * scale, 0.3)
+                if len(fr):
+                    depth = float(fr.min())
+                    o["kind"] = "fenêtre"
+        elif o["kind"] == "porte" and len(far) and len(S):
+            hx, hy, r = S[:, 0], S[:, 1], S[:, 2]
+            dh = np.minimum(np.hypot(hx - pa[0], hy - pa[1]), np.hypot(hx - pb[0], hy - pb[1]))
+            ok = (r >= 0.4 * W) & (r <= 1.2 * W) & (dh <= dmax + 0.1 * scale)
+            if ok.any():
+                k = int(np.nonzero(ok)[0][np.argmin(dh[ok])])
+                # the end of the swing farthest from the wall line = open leaf
+                side = 0.0
+                for ex, ey in ((S[k, 3], S[k, 4]), (S[k, 5], S[k, 6])):
+                    off = (ex - pa[0]) * nx + (ey - pa[1]) * ny
+                    if abs(off) > abs(side):
+                        side = off
+                if side > 0.05 * scale:          # opens into the neighbour
+                    depth = float(far.max())
+        if depth > 0.01 * scale:
+            a = poly[i]
+            s_ = (pa[0] - a[0]) * ux + (pa[1] - a[1]) * uy
+            e_ = (pb[0] - a[0]) * ux + (pb[1] - a[1]) * uy
+            notches.append((i, min(s_, e_), max(s_, e_), depth, o["kind"], nx, ny, ux, uy))
+    if not notches:
+        return poly, openings
+    out, bottoms = [], []
+    for i in range(n):
+        a = poly[i]
+        out.append(a)
+        last = -1.0
+        for _, s_, e_, d, kind, nx, ny, ux, uy in sorted((t for t in notches if t[0] == i),
+                                                         key=lambda t: t[1]):
+            if s_ < last:
+                continue
+            p0 = (a[0] + ux * s_, a[1] + uy * s_)
+            p1 = (a[0] + ux * e_, a[1] + uy * e_)
+            q0 = (p0[0] + nx * d, p0[1] + ny * d)
+            q1 = (p1[0] + nx * d, p1[1] + ny * d)
+            out += [p0, q0, q1, p1]
+            bottoms.append((q0, q1, kind))
+            last = e_
+    out = drop_collinear(out, tol=0.002 * scale)
+    ops = _bridge_openings(prep, out, scale)
+    # the bottom of a recess is the opening (on the frame or the far face)
+    m = len(out)
+    have = {o["edge"] for o in ops}
+    tol = 0.005 * scale
+    for q0, q1, kind in bottoms:
+        for j in range(m):
+            a, b = out[j], out[(j + 1) % m]
+            if j in have:
+                continue
+            if ((math.dist(a, q0) < tol and math.dist(b, q1) < tol)
+                    or (math.dist(a, q1) < tol and math.dist(b, q0) < tol)):
+                ops.append({"edge": j, "a": a, "b": b, "kind": kind})
+                have.add(j)
+                break
+    ops.sort(key=lambda o: o["edge"])
+    return out, ops
 
 
 def snap_polygon(doc, page_no, pts, radius):
