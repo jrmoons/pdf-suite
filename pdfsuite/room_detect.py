@@ -608,14 +608,33 @@ def _build(data: dict):
     # furniture / fittings: small blocks filled light grey (wardrobe, WC frame,
     # appliance), on any layer. Their outline and cross may be drawn apart on
     # the wall layer: lines lying inside such a block are not walls.
+    # On the wall layer, a light grey block is a fitting only in the shade of
+    # the obvious fittings of the page (blocks at least 45 cm deep: wardrobes,
+    # kitchen units): grey walls drawn in another shade stay walls.
     fcell = scale
     fgrid = {}
     pad = 0.01 * scale
+    wall_fill = {}
+    fit_shades = set()
     for path in data["drawings"]:
         if "f" not in path["type"] or not _light_grey(path.get("fill")):
             continue
         ln_ = _norm(path.get("layer"))
-        if _is_wall_layer(ln_) or _is_opening_layer(ln_):
+        if _is_opening_layer(ln_):
+            continue
+        # (a PDF without layers: every block is a candidate fitting, as before)
+        on_wall = _is_wall_layer(ln_) or (not wall_pen and (path.get("layer") or "") in data["walls"])
+        wall_fill[id(path)] = on_wall
+        if on_wall:
+            r = path["rect"]
+            a_, b_ = sorted((abs(r[2] - r[0]), abs(r[3] - r[1])))
+            if 0.45 * scale <= a_ <= 1.3 * scale and b_ <= 3.0 * scale:
+                fit_shades.add(tuple(round(v, 3) for v in path["fill"]))
+    for path in data["drawings"]:
+        on_wall = wall_fill.get(id(path))
+        if on_wall is None:
+            continue
+        if on_wall and (FIT_ON_WALL_OFF or tuple(round(v, 3) for v in path["fill"]) not in fit_shades):
             continue                 # grey walls stay walls
         r = pymupdf.Rect(path["rect"])
         if m is not None:
@@ -624,19 +643,92 @@ def _build(data: dict):
         if (min(w_, h_) < 0.08 * scale or min(w_, h_) > 1.3 * scale
                 or w_ * h_ > 6 * scale * scale):
             continue
-        box = (r.x0 - pad, r.y0 - pad, r.x1 + pad, r.y1 + pad)
+        if on_wall and (max(w_, h_) < 0.5 * scale or not 0.15 * scale <= min(w_, h_) <= 0.8 * scale):
+            continue                 # column, partition, back-to-back wardrobes
+        box = (r.x0 - pad, r.y0 - pad, r.x1 + pad, r.y1 + pad, bool(on_wall))
         for gx in range(int(box[0] // fcell), int(box[2] // fcell) + 1):
             for gy in range(int(box[1] // fcell), int(box[3] // fcell) + 1):
                 fgrid.setdefault((gx, gy), []).append(box)
 
-    def in_furniture(a, b):
-        if not fgrid:
-            return False
+    edge_tol = 2.5 * pad
+
+    def in_box(a, b):
         for bx in fgrid.get((int(a[0] // fcell), int(a[1] // fcell)), ()):
             if (bx[0] <= a[0] <= bx[2] and bx[1] <= a[1] <= bx[3]
                     and bx[0] <= b[0] <= bx[2] and bx[1] <= b[1] <= bx[3]):
+                if bx[4]:
+                    # fitting drawn on the wall layer: a short piece lying on
+                    # its edge is the end of a wall touching it, not its outline
+                    L = math.dist(a, b)
+                    horiz = abs(b[1] - a[1]) <= abs(b[0] - a[0])
+                    on_edge = (min(abs(a[1] - bx[1]), abs(a[1] - bx[3])) < edge_tol if horiz
+                               else min(abs(a[0] - bx[0]), abs(a[0] - bx[2])) < edge_tol)
+                    side = (bx[2] - bx[0]) if horiz else (bx[3] - bx[1])
+                    if on_edge and L < 0.5 * (side - 2 * pad):
+                        continue
                 return True
         return False
+
+    # a wall face lying on the edge of a fitting (thin partition between two
+    # wardrobes) stays a wall: it has a twin face 3-30 cm away, and the strip
+    # between both faces is not inside a fitting
+    protected = set()
+    if fgrid:
+        cand, allw = [], []
+        for path in data["drawings"]:
+            if "s" not in path["type"]:
+                continue
+            lname = path.get("layer") or ""
+            n_ = _norm(lname)
+            if not ((lname in data["walls"] or _is_wall_layer(n_)) and not _is_opening_layer(n_)):
+                continue
+            for it in path.get("items", ()):
+                if it[0] == "l":
+                    pts = [(T(it[1]), T(it[2]))]
+                elif it[0] == "re":
+                    r = it[1]
+                    c = [T((r[0], r[1])), T((r[2], r[1])), T((r[2], r[3])), T((r[0], r[3]))]
+                    pts = [(c[i], c[(i + 1) % 4]) for i in range(4)]
+                else:
+                    continue
+                for a, b in pts:
+                    if math.dist(a, b) < 0.1 * scale:
+                        continue
+                    allw.append(a + b)
+                    if in_box(a, b):
+                        cand.append((a, b))
+        if cand:
+            AW = np.array(allw, float)
+            vx, vy = AW[:, 2] - AW[:, 0], AW[:, 3] - AW[:, 1]
+            vl = np.hypot(vx, vy) + 1e-9
+            for a, b in cand:
+                L = math.dist(a, b)
+                ux, uy = (b[0] - a[0]) / L, (b[1] - a[1]) / L
+                par = np.abs(vx * uy - vy * ux) / vl < 0.03
+                o0 = (AW[:, 0] - a[0]) * uy - (AW[:, 1] - a[1]) * ux
+                o1 = (AW[:, 2] - a[0]) * uy - (AW[:, 3] - a[1]) * ux
+                t0 = (AW[:, 0] - a[0]) * ux + (AW[:, 1] - a[1]) * uy
+                t1 = (AW[:, 2] - a[0]) * ux + (AW[:, 3] - a[1]) * uy
+                ov = np.minimum(np.maximum(t0, t1), L) - np.maximum(np.minimum(t0, t1), 0)
+                off = (o0 + o1) / 2
+                ok = (par & (np.abs(off) >= 0.03 * scale) & (np.abs(off) <= 0.3 * scale)
+                      & (ov >= 0.5 * L))
+                for k in np.nonzero(ok)[0]:
+                    lo_ = max(0.0, min(t0[k], t1[k]))
+                    hi_ = min(L, max(t0[k], t1[k]))
+                    tm = (lo_ + hi_) / 2
+                    h = off[k] / 2
+                    mx, my = a[0] + ux * tm + uy * h, a[1] + uy * tm - ux * h
+                    if not in_box((mx, my), (mx, my)):
+                        protected.add(_seg_key(a, b))
+                        break
+
+    def in_furniture(a, b):
+        if not fgrid:
+            return False
+        if protected and _seg_key(a, b) in protected:
+            return False
+        return in_box(a, b)
 
     import time as _time
     tick = _time.time()
@@ -780,7 +872,7 @@ def _build(data: dict):
     if len(segs):
         segs = segs[np.hypot(segs[:, 2] - segs[:, 0], segs[:, 3] - segs[:, 1]) >= min_len]
     segs = _visible(segs, mask, zoom)
-    bridges, fillers, kinds = _bridges(segs, scale, (ev_lines, ev_circ))
+    bridges, fillers, kinds, swing_lines = _bridges(segs, scale, (ev_lines, ev_circ))
     closers = np.vstack([bridges, fillers])
 
     def lines_mask(lines):
@@ -799,6 +891,12 @@ def _build(data: dict):
                            count=img2.bytesPerLine() * H).reshape(H, img2.bytesPerLine())[:, :W]
         return a2 < 128
 
+    if len(swing_lines):
+        # straight door swings drawn on the wall layer are no walls
+        mask = mask & ~lines_mask(swing_lines)
+        sk = {_seg_key(tuple(l[:2]), tuple(l[2:])) for l in swing_lines}
+        segs = np.array([l for l in segs if _seg_key(tuple(l[:2]), tuple(l[2:])) not in sk],
+                        float).reshape(-1, 4)
     passage = np.array([k == "passage" for k in kinds], bool)
     strong = np.vstack([bridges[~passage], fillers]) if len(bridges) else fillers
     mask_strong = mask | lines_mask(strong)
@@ -1057,7 +1155,7 @@ def _bridges(segs: np.ndarray, scale: float, evidence=((), ())):
     'bridge', exactly on the wall face, when both ends are wall ends (a
     jamb line leaves each end across the face)."""
     if not len(segs):
-        return np.zeros((0, 4)), np.zeros((0, 4)), []
+        return np.zeros((0, 4)), np.zeros((0, 4)), [], np.zeros((0, 4))
     x0, y0, x1, y1 = segs.T
     th = np.arctan2(y1 - y0, x1 - x0) % math.pi
     th[th > math.pi - 0.002] -= math.pi
@@ -1085,9 +1183,49 @@ def _bridges(segs: np.ndarray, scale: float, evidence=((), ())):
     # door swings: centre (hinge) and radius (leaf)
     AR = np.array(ev_arcs, float).reshape(-1, 3)
 
+    swing_lines = []
+
+    def straight_swing(pa, pb, L, dx, dy):
+        """Door drawn with a straight swing (glass door: a triangle): an
+        oblique line from one end of the gap to the tip of the open leaf,
+        which stands across the wall at the other end."""
+        found = []
+        if NOSWING:
+            return found
+        for p0, p1 in ((pa, pb), (pb, pa)):
+            for sgn in (1, -1):
+                tip = (p1[0] - dy * L * sgn, p1[1] + dx * L * sgn)
+                d0 = np.hypot(x0 - p0[0], y0 - p0[1])
+                d1 = np.hypot(x1 - p0[0], y1 - p0[1])
+                fx = np.where(d0 <= d1, x1, x0)
+                fy = np.where(d0 <= d1, y1, y0)
+                ok = ((np.minimum(d0, d1) <= near_end)
+                      & (np.hypot(fx - tip[0], fy - tip[1]) <= 0.25 * L)
+                      & (np.abs(np.cos(th - math.atan2(dy, dx))) > 0.5)
+                      & (np.abs(np.cos(th - math.atan2(dy, dx))) < 0.87))
+                if not ok.any():
+                    continue
+                # the leaf itself: across the wall, from the other end to the tip
+                e0 = np.hypot(x0 - p1[0], y0 - p1[1])
+                e1 = np.hypot(x1 - p1[0], y1 - p1[1])
+                gx = np.where(e0 <= e1, x1, x0)
+                gy = np.where(e0 <= e1, y1, y0)
+                leaf = ((np.minimum(e0, e1) <= near_end)
+                        & (np.hypot(gx - tip[0], gy - tip[1]) <= 0.25 * L)
+                        & (np.abs(np.cos(th - math.atan2(dy, dx))) < 0.2))
+                if not leaf.any():
+                    continue
+                for k in np.nonzero(ok)[0]:
+                    found.append(tuple(segs[k]))
+        return found
+
     def has_evidence(pa, pb):
         L = math.dist(pa, pb)
         dx, dy = (pb[0] - pa[0]) / L, (pb[1] - pa[1]) / L
+        sw = straight_swing(pa, pb, L, dx, dy)
+        if sw:
+            swing_lines.extend(sw)
+            return "porte"
         if len(EL):
             ex0, ey0, ex1, ey1 = EL.T
             vx, vy = ex1 - ex0, ey1 - ey0
@@ -1204,7 +1342,8 @@ def _bridges(segs: np.ndarray, scale: float, evidence=((), ())):
             seen.add(key)
             uniq.append(b)
             ukinds.append(k)
-    return np.array(uniq, float).reshape(-1, 4), np.array(fill, float).reshape(-1, 4), ukinds
+    return (np.array(uniq, float).reshape(-1, 4), np.array(fill, float).reshape(-1, 4), ukinds,
+            np.array(swing_lines, float).reshape(-1, 4))
 
 
 _AREA_RE = __import__("re").compile(r"^\s*\d+[.,]\d+\s*m(²|2)\s*$")
@@ -1852,6 +1991,8 @@ def _bridge_openings(prep, pts, scale):
     return out
 
 
+NOSWING = bool(__import__("os").environ.get("NOSWING"))
+FIT_ON_WALL_OFF = bool(__import__("os").environ.get("FIT_ON_WALL_OFF"))
 SILL_ZERO_M = 0.02          # sill at most this high = floor-level window
 SILL_NEAR_M = 1.6           # sill text -> its window: at most this far
 RECESS_MAX_M = 0.7          # wall thickness: a threshold / recess is at most this deep

@@ -57,6 +57,13 @@
   embrasure jusqu'au châssis (trait du calque fenêtre, morceaux additionnés), allège > 0 → droit.
   `detect_room` renvoie aussi `polygon_nu` (au nu des murs) : le banc compare CE polygone aux
   étiquettes m² du plan.
+  Captures du 2026-11-12 : blocs gris clair SUR le calque des murs = équipements (bâti WC,
+  placards) seulement dans la teinte des gros blocs de la page (≥ 45 cm de profondeur), entre
+  15 et 80 cm de profondeur, ≥ 50 cm de long ; pas sur PDF à plat ; face de mur collée à un bloc
+  gardée si elle a une face jumelle à 3-30 cm hors bloc ; petits bouts de mur sur le bord d'un
+  bloc gardés. Porte vitrée en triangle (trait en biais jamb → bout du vantail + vantail
+  perpendiculaire) = porte, le biais est effacé du masque. Interrupteurs de banc : NOSWING,
+  FIT_ON_WALL_OFF. Score 284/539 à 2 %.
   Reste à faire : halls en L / circulations (Hall RDJ Arlon 1 9,32 → 2,6 m²), WC bâti-support,
   porte de douche en verre en biais, terrasse/châssis coulissant à vérifier, murs hors calque
   « Mur ». Piège : mes scripts heredoc ont cassé des `\b` / `\n` → relire après chaque patch.
